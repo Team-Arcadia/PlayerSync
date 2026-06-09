@@ -46,8 +46,12 @@ public class JDBCsetUp {
         // FIX PERF (C9): right-sized pool. 25 was oversized; empirical HikariCP rule is
         // ~ cores*2 + spindles. 15 handles 35 concurrent players comfortably and reduces
         // MySQL server-side context switching.
-        cfg.setMaximumPoolSize(15);
-        cfg.setMinimumIdle(4);
+        // FIX CONFIG (AUDIT-4): hikari_pool_max_size was defined in the config but never
+        // read — the pool size was hardcoded. Now honoured (default 15).
+        int maxPool;
+        try { maxPool = JdbcConfig.HIKARI_POOL_MAX_SIZE.get(); } catch (Throwable t) { maxPool = 15; }
+        cfg.setMaximumPoolSize(maxPool);
+        cfg.setMinimumIdle(Math.min(4, maxPool));
 
         // Connection lifecycle
         cfg.setConnectionTimeout(10_000L);   // 10 s – fail fast on MySQL outage
@@ -60,7 +64,10 @@ public class JDBCsetUp {
 
         // FIX PERF (C9): 25s threshold — covers worst-case doPlayerJoin poll bursts without
         // flooding logs with false positives. Previous 10s fired during legitimate 15-30s polls.
-        cfg.setLeakDetectionThreshold(25_000L);
+        // FIX CONFIG (AUDIT-4): hikari_leak_threshold_ms was defined but never read.
+        long leakMs;
+        try { leakMs = JdbcConfig.HIKARI_LEAK_THRESHOLD_MS.get(); } catch (Throwable t) { leakMs = 25_000L; }
+        cfg.setLeakDetectionThreshold(leakMs);
 
         dataSource = new HikariDataSource(cfg);
         LOGGER.info("[PlayerSync] HikariCP pool ready (maxPool={}, minIdle={})",
@@ -148,19 +155,10 @@ public class JDBCsetUp {
     // Query helpers (API unchanged — callers need no modification)
     // -------------------------------------------------------------------------
 
-    public static QueryResult executeQuery(String sqlFormatString, Object... args) throws SQLException {
-        String sql = String.format(sqlFormatString, args);
-        LOGGER.trace(sql);
-        Connection connection = getConnection();
-        try {
-            PreparedStatement stmt = connection.prepareStatement(sql);
-            ResultSet rs = stmt.executeQuery();
-            return new QueryResult(connection, stmt, rs);
-        } catch (SQLException e) {
-            try { connection.close(); } catch (SQLException ignored) {}
-            throw e;
-        }
-    }
+    // AUDIT-8 SECURITY: removed the unused executeQuery(String.format) and
+    // update(String, String...) helpers. Both interpolated caller values directly
+    // into the SQL string (format-string injection surface) and had ZERO call sites.
+    // All live queries go through the executePrepared* family below.
 
     private static void executeUpdateInternal(boolean selectDatabase, String sqlFormatString, Object... args) throws SQLException {
         String sql = String.format(sqlFormatString, args);
@@ -183,17 +181,6 @@ public class JDBCsetUp {
         LOGGER.trace(sql);
         try (Connection conn = getConnection(false);
              PreparedStatement stmt = conn.prepareStatement(sql)) {
-            stmt.executeUpdate();
-        }
-    }
-
-    public static void update(String sql, String... argument) throws SQLException {
-        LOGGER.trace(sql);
-        try (Connection conn = getConnection();
-             PreparedStatement stmt = conn.prepareStatement(sql)) {
-            for (int i = 0; i < argument.length; i++) {
-                stmt.setString(i + 1, argument[i]);
-            }
             stmt.executeUpdate();
         }
     }

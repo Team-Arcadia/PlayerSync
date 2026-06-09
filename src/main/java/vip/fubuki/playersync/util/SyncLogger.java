@@ -237,10 +237,16 @@ public class SyncLogger {
 
     private static void flushQueue() {
         if (logPath == null) return;
+        // AUDIT-9: rotation check moved here (was only run once at init — the 10MB cap
+        // was never enforced afterwards, letting sync.log grow unbounded).
+        rotateIfNeeded();
         try (BufferedWriter writer = new BufferedWriter(new FileWriter(logPath.toFile(), true))) {
             String line;
             int count = 0;
-            while ((line = writeQueue.poll()) != null && count < 100) {
+            // AUDIT-9: cap raised 100 → 5000 per 500ms flush. The old cap (200 lines/s)
+            // let the in-memory queue grow without bound under sustained load
+            // (mass join/leave, poll storms) — a slow memory leak.
+            while ((line = writeQueue.poll()) != null && count < 5000) {
                 writer.write(line);
                 writer.newLine();
                 count++;

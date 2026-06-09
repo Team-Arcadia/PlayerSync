@@ -248,7 +248,7 @@ public class VanillaSync {
     }
 
     @SubscribeEvent
-    public static void onDataPackSyncEvent(OnDatapackSyncEvent event) throws SQLException, IOException {
+    public static void onDataPackSyncEvent(OnDatapackSyncEvent event) {
         if (!JdbcConfig.SYNC_ADVANCEMENTS.get())
             return; // advancement sync disabled
 
@@ -261,6 +261,26 @@ public class VanillaSync {
         final String player_uuid = serverPlayer.getUUID().toString();
         PlayerSync.LOGGER.info("Player entity joining level {}", player_uuid);
 
+        // FIX PERF (AUDIT-6): the DB SELECT + advancements file write previously ran
+        // synchronously on the MAIN THREAD (OnDatapackSyncEvent fires there) — a blocking
+        // MySQL round-trip + disk I/O per join, 5-200ms each. Now both run on the BG
+        // executor; only PlayerAdvancements.reload() (which must touch live server state)
+        // hops back to the main thread.
+        try {
+            executorService.submit(() -> {
+                try {
+                    applyAdvancementsFromDB(serverPlayer, player_uuid);
+                } catch (Exception e) {
+                    PlayerSync.LOGGER.error("Error syncing advancements for player {}", player_uuid, e);
+                }
+            });
+        } catch (java.util.concurrent.RejectedExecutionException rex) {
+            PlayerSync.LOGGER.warn("Advancement sync rejected for {} (executor shutting down)", player_uuid);
+        }
+    }
+
+    /** AUDIT-6: full advancements read+apply, runs on a BACKGROUND thread. */
+    private static void applyAdvancementsFromDB(ServerPlayer serverPlayer, String player_uuid) throws SQLException, IOException {
         // Use try-with-resources to prevent connection leaks
         String advancementsData;
         try (JDBCsetUp.QueryResult advancementsQuery = JDBCsetUp.executePreparedQuery(
@@ -329,9 +349,13 @@ public class VanillaSync {
             PlayerSync.LOGGER.trace("Writing advancement file for player {}: {}", player_uuid, new String(bytes, StandardCharsets.UTF_8));
             Files.write(advancements.toPath(), bytes);
 
-            // reload the JSON files on the server after updating them
-            PlayerAdvancements playeradvancements = serverPlayer.getAdvancements();
-            playeradvancements.reload(server.getAdvancements());
+            // reload the JSON files on the server after updating them.
+            // AUDIT-6: reload() walks live advancement state — main thread only.
+            server.execute(() -> {
+                if (!isPlayerOnline(server, player_uuid)) return; // player left during async fetch
+                PlayerAdvancements playeradvancements = serverPlayer.getAdvancements();
+                playeradvancements.reload(server.getAdvancements());
+            });
 
         } else {
             PlayerSync.LOGGER.debug("Writing non-dedicated server advancement files");
@@ -536,6 +560,16 @@ public class VanillaSync {
             // in < 1s, so 10s is 10× safety margin.
             final long LOGOUT_SAVE_MAX_MS = 10_000L;
             final int SELF = JdbcConfig.SERVER_ID.get();
+            // FIX CONFIG (AUDIT-3): honour join_peer_alive_max_wait_seconds. It was defined,
+            // documented ("default 600s = never force-claim on an alive peer. SAFE.") but
+            // never read — the code force-claimed after a hardcoded 2s, exactly the dup
+            // risk the config comment warns about. Compromise: when the kick policy is ON,
+            // an online=1-without-logout-flag row that survived the kick check is almost
+            // certainly a ghost session → keep the short 2s grace to avoid locking the
+            // player out. When the kick policy is OFF, respect the configured (safe) wait.
+            final long PEER_ALIVE_MAX_WAIT_MS = JdbcConfig.KICK_WHEN_ALREADY_ONLINE.get()
+                    ? 2000L
+                    : JdbcConfig.JOIN_PEER_ALIVE_MAX_WAIT_SECONDS.get() * 1000L;
 
             boolean forceClaim = false;   // bypass online=0 / last_server=self guard
             // PHASE 18.1 FIX: track whether the row exists at all. A brand-new player
@@ -610,7 +644,7 @@ public class VanillaSync {
                 // cache was empty / peer's heartbeat just landed), and force-claim.
                 // If kick_when_already_online is true, the player who SHOULD be kicked
                 // is the one who lost the race — not us.
-                if (waitedMs >= 2000L) {
+                if (waitedMs >= PEER_ALIVE_MAX_WAIT_MS) {
                     SyncLogger.raceCondition(player_uuid,
                             "Peer " + otherServer + " online=1 without logout flag — ghost session, force-claiming (waited " + waitedMs + "ms)");
                     forceClaim = true;
@@ -676,8 +710,14 @@ public class VanillaSync {
             final int health, foodLevel, xp, score;
             final String leftHand, cursors, armorData, inventoryData, enderChestData, effectData;
 
+            // FIX PERF (AUDIT-5): explicit column list instead of SELECT *. The previous
+            // query also transferred the `advancements` MEDIUMBLOB (up to several MB of
+            // JSON) on EVERY join even though this path never reads it — advancements are
+            // handled separately by onDataPackSyncEvent. Cuts join-time network transfer
+            // and MySQL buffer pressure dramatically for veteran players.
             try (JDBCsetUp.QueryResult qr2 = JDBCsetUp.executePreparedQuery(
-                    "SELECT * FROM " + Tables.playerData() + " WHERE uuid=?", player_uuid)) {
+                    "SELECT health, food_level, xp, score, left_hand, cursors, armor, inventory, enderchest, effects FROM "
+                            + Tables.playerData() + " WHERE uuid=?", player_uuid)) {
                 ResultSet rs2 = qr2.resultSet();
                 if (!rs2.next()) {
                     // No row in DB → brand new player, run the init path on main thread.
@@ -1287,16 +1327,26 @@ public class VanillaSync {
      * @param label  a short tag used in log lines for diagnosis (e.g. "SaveToFile",
      *               "PERIODIC", "DIMENSION")
      */
+    /** AUDIT-7: last piggyback heartbeat timestamp — rate-limits the per-save UPDATE. */
+    private static volatile long lastPiggybackHeartbeatMs = 0L;
+
     public static void snapshotAndQueueSave(Player player, String label) {
-        // Heartbeat piggyback — cheap, keeps server_info fresh even if no SaveToFile ticks.
-        executorService.submit(() -> {
-            try {
-                JDBCsetUp.executePreparedUpdate("UPDATE " + Tables.serverInfo() + " SET last_update=? WHERE id=?",
-                        System.currentTimeMillis(), JdbcConfig.SERVER_ID.get());
-            } catch (SQLException e) {
-                PlayerSync.LOGGER.error("Error updating server heartbeat on {}", label, e);
-            }
-        });
+        // Heartbeat piggyback — keeps server_info fresh even if no SaveToFile ticks.
+        // AUDIT-7 PERF: rate-limited to once per 15s. Previously EVERY save trigger
+        // (35 players × vanilla autosave) queued its own UPDATE server_info — dozens of
+        // redundant DB round-trips per cycle on top of HeartbeatService's own writes.
+        long now = System.currentTimeMillis();
+        if (now - lastPiggybackHeartbeatMs > 15_000L) {
+            lastPiggybackHeartbeatMs = now;
+            executorService.submit(() -> {
+                try {
+                    JDBCsetUp.executePreparedUpdate("UPDATE " + Tables.serverInfo() + " SET last_update=? WHERE id=?",
+                            System.currentTimeMillis(), JdbcConfig.SERVER_ID.get());
+                } catch (SQLException e) {
+                    PlayerSync.LOGGER.error("Error updating server heartbeat on {}", label, e);
+                }
+            });
+        }
 
         String puuid = player.getUUID().toString();
 
@@ -1985,7 +2035,13 @@ public class VanillaSync {
         String base64 = encoded.substring(5); // Remove "BNBT:" prefix
         byte[] bytes = Base64.getDecoder().decode(base64);
         java.io.ByteArrayInputStream bais = new java.io.ByteArrayInputStream(bytes);
-        return net.minecraft.nbt.NbtIo.readCompressed(bais, net.minecraft.nbt.NbtAccounter.unlimitedHeap());
+        // FIX SECURITY (AUDIT-1): bounded NbtAccounter instead of unlimitedHeap().
+        // A malicious/corrupted gzip "NBT bomb" stored in the DB (a few KB compressed
+        // can inflate to gigabytes) would otherwise OOM-crash the server on restore.
+        // Cap decompressed size at 2x max_inventory_size_bytes (default 20 MB) —
+        // far above any legitimate player payload.
+        long maxBytes = 2L * JdbcConfig.MAX_INVENTORY_SIZE_BYTES.get();
+        return net.minecraft.nbt.NbtIo.readCompressed(bais, net.minecraft.nbt.NbtAccounter.create(maxBytes));
     }
 
     public static Tag serializeNBT(ItemStack itemStack) {
@@ -2540,13 +2596,17 @@ public class VanillaSync {
     // All periodic tasks merged into a single ServerTickEvent handler.
     // FIX: Previously used LevelTickEvent which fires once per dimension, causing the tick counter
     // to increment 3x faster than expected (once per overworld, nether, end).
-    private static int heartbeatTickCounter = 0;
-    private static final int HEARTBEAT_INTERVAL_TICKS = 600; // Every 30 seconds (20 tps * 30s)
-    private static int autoSaveTickCounter = 0;
-    private static final int AUTO_SAVE_INTERVAL_TICKS = 6000; // Every 5 minutes (20 tps × 300s)
+    //
+    // FIX PERF (AUDIT-7): removed the tick-based heartbeat (duplicate of HeartbeatService,
+    // which already writes server_info every heartbeat_interval_seconds on its own
+    // scheduler) and the tick-based 5-min queue refill (duplicate of PeriodicSaveService,
+    // which is configurable via auto_save_interval_minutes and feeds the same staggered
+    // queue). Previously THREE periodic save mechanisms overlapped (tick refill 5 min +
+    // PeriodicSaveService 10 min + vanilla SaveToFile), roughly tripling DB write load.
+    //
     // FIX PERF: Staggered auto-save. Instead of snapshotting ALL 35 players in one tick
     // (770-3605ms spike → 15-36s TPS drop), we save 1 player per tick over 35 ticks
-    // (22-103ms per tick → imperceptible). The queue is refilled every AUTO_SAVE_INTERVAL.
+    // (22-103ms per tick → imperceptible). The queue is refilled by PeriodicSaveService.
     private static final List<ServerPlayer> autoSaveQueue = new ArrayList<>();
 
     /**
@@ -2582,8 +2642,6 @@ public class VanillaSync {
 
     @SubscribeEvent
     public static void onServerTick(ServerTickEvent.Post event) {
-        heartbeatTickCounter++;
-        autoSaveTickCounter++;
         autoCleanCuriosCacheTickCounter++;
 
         // PERF (A7): every 600 ticks (~30 s) drop any connectCheckCache entry older
@@ -2598,49 +2656,28 @@ public class VanillaSync {
             }
         }
 
-        // Heartbeat: update server_info to prove this server is alive
-        if (heartbeatTickCounter >= HEARTBEAT_INTERVAL_TICKS) {
-            heartbeatTickCounter = 0;
-            executorService.submit(() -> {
-                try {
-                    JDBCsetUp.executePreparedUpdate("UPDATE " + Tables.serverInfo() + " SET last_update=? WHERE id=?",
-                            System.currentTimeMillis(), JdbcConfig.SERVER_ID.get());
-                } catch (SQLException e) {
-                    PlayerSync.LOGGER.error("Error updating server heartbeat", e);
-                }
-            });
-        }
-
-        // Auto-save: snapshot ALL entity data on MAIN THREAD (fast, no I/O), then write
-        // to DB on a BACKGROUND THREAD.
-        //
-        // FIX: Previously the background task called ModCompatSync.storeAll(player),
-        // storeSophisticatedBackpacks(player), etc. from off-thread — accessing entity
-        // state (inventory, Accessories API, CosmeticArmor, NeoForge attachments) in a
-        // non-thread-safe way.  All entity reads are now done in snapshotPlayerData()
-        // on the main thread, and the background task only does DB writes.
-        //
-        // FIX PERF: Staggered auto-save — saves ONE player per tick instead of ALL at once.
-        // Old behavior: 35 players snapshotted in ONE tick → 770-3605ms MSPT spike every 5 min.
-        // New behavior: queue refilled every 5 min, then drained 1 player/tick → 22-103ms/tick max.
-        // Backpack contents are included (prevents data loss on hard crash).
-        if (autoSaveTickCounter >= AUTO_SAVE_INTERVAL_TICKS) {
-            autoSaveTickCounter = 0;
-            // Refill the queue with all eligible players
-            autoSaveQueue.clear();
-            MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
-            if (server != null) {
-                autoSaveQueue.addAll(server.getPlayerList().getPlayers());
-            }
-        }
+        // AUDIT-7: heartbeat is handled exclusively by HeartbeatService; the periodic
+        // queue refill is handled exclusively by PeriodicSaveService (via
+        // enqueueAllOnlineForStaggeredSave). This handler only DRAINS the queue.
 
         // Process ONE player from the queue per tick (staggered)
         if (!autoSaveQueue.isEmpty()) {
             ServerPlayer player = autoSaveQueue.removeFirst();
             String puuid = player.getUUID().toString();
 
+            // FIX DUP (AUDIT-2): the queue holds a STRONG reference to the entity captured
+            // at refill time. If the player disconnected (and possibly reconnected) since,
+            // this reference is a STALE entity whose inventory reflects the PRE-logout
+            // state. Snapshotting it would overwrite the fresh logout save / fresh restore
+            // with old data — classic drop+relog item duplication. Only proceed when this
+            // exact entity instance is still the live one in the player list.
+            MinecraftServer curServer = ServerLifecycleHooks.getCurrentServer();
+            boolean entityCurrent = curServer != null
+                    && !player.hasDisconnected()
+                    && curServer.getPlayerList().getPlayer(player.getUUID()) == player;
+
             // Skip invalid players (same guards as before)
-            if (!player.isDeadOrDying() && !syncNotCompletedPlayer.contains(puuid)
+            if (entityCurrent && !player.isDeadOrDying() && !syncNotCompletedPlayer.contains(puuid)
                     && !pendingLogoutSaves.containsKey(puuid) && player.getTags().contains("player_synced")) {
                 ReentrantLock lock = getPlayerLock(puuid);
                 if (lock.tryLock()) {
