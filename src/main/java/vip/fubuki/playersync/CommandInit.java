@@ -73,6 +73,7 @@ public class CommandInit {
                 .then(Commands.literal("version").executes(CommandInit::runVersion))
                 .then(Commands.literal("status").executes(CommandInit::runStatus))
                 .then(Commands.literal("poolstats").executes(CommandInit::runPoolStats))
+                .then(Commands.literal("compat").executes(CommandInit::runCompat))
 
                 // ---- Player ops ----
                 .then(Commands.literal("flush")
@@ -206,6 +207,50 @@ public class CommandInit {
             replySuccess(src, "§7auto_save: §f" + JdbcConfig.AUTO_SAVE_INTERVAL_MINUTES.get() + "min"
                     + "   §7heartbeat_interval: §f" + JdbcConfig.HEARTBEAT_INTERVAL_SECONDS.get() + "s", false);
         });
+    }
+
+    /**
+     * Reports every integration PlayerSync knows about, whether the mod is present and
+     * whether its sync toggle is on. Runs entirely on the main thread — no DB access —
+     * so it stays usable when the database is the thing being diagnosed.
+     */
+    private static int runCompat(com.mojang.brigadier.context.CommandContext<CommandSourceStack> ctx) {
+        CommandSourceStack src = ctx.getSource();
+        var entries = vip.fubuki.playersync.sync.addons.ModCompatRegistry.entries();
+        src.sendSuccess(() -> Component.literal("§a=== PlayerSync compatibility ==="), false);
+        int present = 0, disabled = 0;
+        for (var e : entries) {
+            boolean loaded = e.loaded();
+            if (!loaded) continue;
+            present++;
+            boolean active = e.active();
+            if (!active) disabled++;
+            String state = active ? "§aSYNCED" : "§cDISABLED";
+            String toggle = e.toggleName() == null ? "" : " §8(" + e.toggleName() + ")";
+            src.sendSuccess(() -> Component.literal(
+                    "  " + state + " §f" + e.displayName() + " §8[" + e.modId() + "]" + toggle
+                            + "\n      §7" + e.mechanism().label + " — " + e.note()), false);
+        }
+        final int fPresent = present, fDisabled = disabled;
+        if (fPresent == 0) {
+            src.sendSuccess(() -> Component.literal("§7No optional integration detected — vanilla player data only."), false);
+        } else {
+            src.sendSuccess(() -> Component.literal("§7" + fPresent + " integration(s) present"
+                    + (fDisabled > 0 ? ", §c" + fDisabled + " disabled by config" : ", §aall enabled")), false);
+        }
+        // Mods PlayerSync knows about but that are absent here: useful when comparing two
+        // servers in the same network, where an asymmetric mod list is what actually causes
+        // "my items became paper" reports.
+        StringBuilder absent = new StringBuilder();
+        for (var e : entries) {
+            if (!e.loaded()) absent.append(absent.isEmpty() ? "" : ", ").append(e.modId());
+        }
+        if (!absent.isEmpty()) {
+            src.sendSuccess(() -> Component.literal("§8not installed here: " + absent), false);
+        }
+        src.sendSuccess(() -> Component.literal("§7storage handles tracked: §f"
+                + vip.fubuki.playersync.sync.addons.StorageOwnership.trackedCount()), false);
+        return 1;
     }
 
     private static int runPoolStats(com.mojang.brigadier.context.CommandContext<CommandSourceStack> ctx) {

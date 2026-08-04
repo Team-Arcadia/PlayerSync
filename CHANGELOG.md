@@ -4,7 +4,79 @@ All notable changes to **PlayerSync** are documented here.
 
 ---
 
-## [Unreleased] - 2026-06-09 (full audit: server performance + security + dup hardening)
+## [2.1.6] - 2026-08-04 (container duplication, Refined Storage loss, AE2 + Corail Tombstone)
+
+### Fixed (English first)
+
+- **Backpack duplication when a container is emptied (#238)** — Sophisticated Backpacks keeps a carried backpack's contents in a world SavedData keyed by the container UUID, and `getOrCreateBackpackContents` is a `computeIfAbsent`: asking about a container PlayerSync had never loaded silently created an empty entry. The save path could therefore not tell "the player emptied this backpack" from "this server has never seen it", and a guard skipped the write whenever the database still held data. Emptying a backpack into a chest and reconnecting re-injected the old contents — the items then existed in both places. Save and restore now speak an explicit protocol: PlayerSync records which containers it actually established for a session (`StorageOwnership`), reads the mod's SavedData through a non-creating probe, and writes an explicit empty tombstone that the next restore mirrors by clearing its local copy. A container this server never loaded is never written, so it can no longer overwrite fresher data either.
+- **Refined Storage 2 disks losing everything after a server change** — PlayerSync resolved RS2's private `createCodec(Runnable)` once and cached the resulting codec with a no-op listener. That Runnable is the change listener baked into every storage the codec decodes (the repository's own constructor passes `this::markAsChanged`), so every disk PlayerSync restored came back deaf: RS2 never marked its SavedData dirty when the player subsequently used that disk, the world save skipped the file, and everything written since the transfer was gone after the next restart. Only the reflective method handle is cached now; the codec is rebuilt per repository with a live `markAsChanged` listener.
+- **Refined Storage 2 disks silently not saved** — disk encoding ran on the background writer thread, reading the live `StorageRepository` while the main thread could mutate it. A failed encode was logged at DEBUG and skipped, so the disk simply never reached the database and the player arrived on the next server with an empty one. Encoding now happens on the main thread with the same snapshot-then-write pattern the backpack and Sophisticated Storage paths already use, and an encode failure is logged as an error naming the disk.
+- **Containers carried in Curios slots were never synced** — the Sophisticated Storage and RS2 disk collectors only walked the vanilla inventory and the ender chest. A shulker or a storage disk kept in a belt / back / charm slot was neither saved nor restored, so its contents diverged between servers. All three collectors now share one definition of "everything the player carries": inventory, armor, offhand, ender chest and Curios slots.
+- **`join_peer_alive_max_wait_seconds` was documented but never read** — the join protocol force-claimed ownership from an ALIVE peer after a hardcoded 2 seconds, the exact behaviour the config comment described as risky. Claiming makes every later write from that peer fail its `last_server` guard, so anything it recorded after the claim (a pickup, a drop, a deposit) is discarded while the world still holds the matching entity. The key now applies; its documented default (600 s = never force-claim on a live peer) is finally in effect.
+- **sync.log could grow the heap without bound** — the write queue was unbounded while the flusher drained at most 100 lines every 500 ms. A database outage produces far more than 200 lines/s, so the backlog grew indefinitely. The queue is now capped at 20 000 lines with the overflow counted and reported in the log itself, and the drain batch is large enough to keep up.
+- **Final log entries lost on shutdown** — `shutdown()` ran a single flush pass, so on a busy stop the last entries (the save results an admin needs after an incident) were dropped. It now drains fully.
+- **NPE when a save races server stop** — `getConnection` read the pool field twice, letting `shutdownPool()` null it between the guard and the call. Callers catch `SQLException`, not `NullPointerException`, so the failure escaped as an unhandled error. The volatile is read once.
+- **A dead-but-connected MySQL could freeze every save path** — no socket timeout was set, so a query to a host that dies with the TCP connection half-open blocked its worker until the OS keepalive expired. New `jdbc_socket_timeout_seconds` (default 60).
+
+### Added (English first)
+
+- **Corail Tombstone support** — Tombstone stores knowledge, alignment, perks and watcher knowledge in the player's persistent-data tag (`PlayerPersisted → tb_player_tag`) and writes through on every setter. PlayerSync only synced NeoForge attachments, so a player changing server arrived with their whole Tombstone progression reset. The persistent-data tag is now mirrored as well, which also covers the long tail of other mods still using that scratchpad. Governed by `sync_persistent_data` (default true) with a `persistent_data_blacklist` for world-bound keys. Graves stay in the world where the player died; that is a property of the mod, not something a sync can move.
+- **Applied Energistics 2 support** — AE2 storage cells keep their contents in item components (`ae2:storage_cell_inv`), so they travel with the inventory serialization; this release verifies and declares that path rather than leaving it to chance. Spatial cells and wireless links remain bound to the world that owns them.
+- **Item component integrity canary** — everything a modern mod keeps "inside" an item is a DataComponent (an AE2 cell's inventory, a shulker's `minecraft:container`, Apotheosis affixes). If one is ever dropped during a restore the item arrives looking correct and simply empty. PlayerSync now compares the component keys the stored tag declared against those the parsed stack carries and reports the exact item and component instead of leaving an admin with "my cell came back empty".
+- **`/playersync compat`** — lists every integration PlayerSync knows about, whether the mod is present, which mechanism carries its data, and whether its sync toggle is on. Also lists the known mods that are absent here, which is what an asymmetric mod list between two servers of the same network looks like. Runs without touching the database, so it stays usable while diagnosing the database. The same report is printed once at server start, with a warning for any mod installed while its toggle is off.
+
+### Performance (English first)
+
+- **Sophisticated Storage and RS2 disks join the staggered auto-save** — they used to be persisted only at logout and shutdown, so a hard crash lost everything a player had moved into a shulker or a disk since login. Cost stays bounded: one player per tick, and unchanged blobs are still skipped by their per-UUID hash.
+- **One batched transaction per save instead of three** — backpack, Sophisticated Storage and RS2 blobs all live in `backpack_data`; they are now captured into a single map and written in one transaction.
+- **Brand-new containers no longer cost a query each** — the join prefetch now records which UUIDs it queried, so a UUID that came back without a row is known absent and the restore takes its "missing" branch without a second SELECT on the main thread.
+- **The mod's SavedData is no longer polluted by snapshots** — reading a container through `getOrCreateBackpackContents` inserted an empty entry and marked the SavedData dirty. The non-creating probe leaves it untouched.
+- **Dead death-time curios cache removed** — it serialized every player's curios on each logout, death and shutdown into a map whose only reader had been unreachable for several releases. Pure work on the hot paths.
+- **Auto-save queue holds UUIDs, not entities** — queueing `ServerPlayer` references kept a disconnected player's whole object graph (inventory, container menus, level links) reachable for up to a full auto-save cycle. Resolution through the PlayerList at drain time is O(1) and always yields the live entity.
+- **Dead code removed** — the unreachable legacy store/restore paths in `ModsSupport` and `ModCompatSync`, the curios cache, `alterColumnIfNeeded`, and the unused `JDBCsetUp.update` helper.
+
+### Changed (English first)
+
+- **Sync toggles are now symmetric** — `sync_backpacks` and `sync_refined_storage` gated the restore side only, so a server with the toggle off kept publishing container blobs it never read back and its stale local copy eventually overwrote everyone else's. Both halves are gated now.
+- **`join_peer_alive_max_wait_seconds` changes join behaviour on a live peer.** With its default of 600 s the poll budget (`join_poll_max_attempts` × `join_poll_interval_ms`) runs out first and the player is asked to reconnect instead of taking ownership from a peer that may still be committing. Set it to 15-30 to restore a fast ghost-session takeover, accepting the duplication risk the key documents.
+
+### Correctifs (miroir français)
+
+- **Duplication de backpack quand un conteneur est vidé (#238)** — Sophisticated Backpacks garde le contenu d'un backpack porté dans une SavedData indexée par l'UUID du conteneur, et `getOrCreateBackpackContents` est un `computeIfAbsent` : interroger un conteneur que PlayerSync n'avait jamais chargé créait silencieusement une entrée vide. Le chemin de sauvegarde ne pouvait donc pas distinguer « le joueur a vidé ce backpack » de « ce serveur ne l'a jamais vu », et un garde annulait l'écriture dès que la base contenait encore des données. Vider un backpack dans un coffre puis se reconnecter réinjectait l'ancien contenu — les objets existaient alors aux deux endroits. Sauvegarde et restauration suivent désormais un protocole explicite : PlayerSync mémorise les conteneurs réellement établis pour une session (`StorageOwnership`), lit la SavedData du mod via une sonde qui ne crée rien, et écrit une pierre tombale vide que la restauration suivante reflète en effaçant sa copie locale. Un conteneur que ce serveur n'a jamais chargé n'est jamais écrit, il ne peut donc plus écraser des données plus fraîches non plus.
+- **Disques Refined Storage 2 vidés après un changement de serveur** — PlayerSync résolvait le `createCodec(Runnable)` privé de RS2 une fois et mettait en cache le codec obtenu avec un listener vide. Ce Runnable est le listener de changement intégré à chaque stockage décodé par le codec (le constructeur du dépôt passe `this::markAsChanged`) : chaque disque restauré par PlayerSync revenait donc sourd. RS2 ne marquait plus sa SavedData modifiée quand le joueur utilisait ce disque, la sauvegarde du monde ignorait le fichier, et tout ce qui avait été écrit depuis le transfert disparaissait au redémarrage suivant. Seul le handle réflexif est mis en cache maintenant ; le codec est reconstruit par dépôt avec un listener `markAsChanged` vivant.
+- **Disques Refined Storage 2 silencieusement non sauvegardés** — l'encodage tournait sur le thread d'écriture en arrière-plan, lisant le `StorageRepository` vivant pendant que le main thread pouvait le modifier. Un échec d'encodage était logué en DEBUG puis ignoré : le disque n'atteignait jamais la base et le joueur arrivait sur le serveur suivant avec un disque vide. L'encodage se fait maintenant sur le main thread, selon le même schéma snapshot-puis-écriture que les backpacks et Sophisticated Storage, et un échec est logué en erreur avec l'identifiant du disque.
+- **Les conteneurs portés dans des slots Curios n'étaient jamais synchronisés** — les collecteurs Sophisticated Storage et disques RS2 ne parcouraient que l'inventaire vanilla et l'ender chest. Un shulker ou un disque rangé dans un slot ceinture / dos / charme n'était ni sauvegardé ni restauré, et son contenu divergeait entre serveurs. Les trois collecteurs partagent désormais une seule définition de « tout ce que le joueur porte » : inventaire, armure, main secondaire, ender chest et slots Curios.
+- **`join_peer_alive_max_wait_seconds` était documentée mais jamais lue** — le protocole de connexion réclamait la propriété à un pair VIVANT après 2 secondes codées en dur, exactement le comportement que le commentaire de la clé décrit comme risqué. Réclamer la propriété fait échouer le garde `last_server` de toute écriture ultérieure du pair : ce qu'il avait enregistré après la réclamation (un ramassage, un drop, un dépôt) est perdu alors que le monde contient toujours l'entité correspondante. La clé s'applique enfin ; sa valeur par défaut documentée (600 s = jamais de réclamation forcée sur un pair vivant) est effective.
+- **sync.log pouvait faire croître la heap sans limite** — la file d'écriture était non bornée alors que le flush drainait au plus 100 lignes toutes les 500 ms. Une panne de base produit bien plus que 200 lignes/s, le retard grandissait donc indéfiniment. La file est plafonnée à 20 000 lignes, le débordement est compté et signalé dans le log lui-même, et le lot de drainage suit la cadence.
+- **Dernières entrées de log perdues à l'arrêt** — `shutdown()` ne faisait qu'une passe de flush : lors d'un arrêt chargé, les dernières entrées (les résultats de sauvegarde dont un admin a besoin après un incident) étaient perdues. Le drainage est maintenant complet.
+- **NPE quand une sauvegarde croise l'arrêt du serveur** — `getConnection` lisait le champ du pool deux fois, laissant `shutdownPool()` le mettre à null entre le garde et l'appel. Les appelants attrapent `SQLException`, pas `NullPointerException` : l'échec remontait en erreur non gérée. Le volatile est lu une seule fois.
+- **Un MySQL mort mais connecté pouvait figer tous les chemins de sauvegarde** — aucun socket timeout n'était défini : une requête vers un hôte qui meurt avec la connexion TCP à moitié ouverte bloquait son worker jusqu'à expiration du keepalive OS. Nouvelle clé `jdbc_socket_timeout_seconds` (60 par défaut).
+
+### Ajouts (miroir français)
+
+- **Support de Corail Tombstone** — Tombstone stocke connaissance, alignement, perks et savoir du Gardien dans le tag de données persistantes du joueur (`PlayerPersisted → tb_player_tag`) et écrit à chaque setter. PlayerSync ne synchronisait que les attachements NeoForge : un joueur changeant de serveur arrivait avec toute sa progression Tombstone réinitialisée. Le tag persistant est désormais répliqué, ce qui couvre aussi les nombreux autres mods utilisant encore ce stockage. Piloté par `sync_persistent_data` (true par défaut) avec une `persistent_data_blacklist` pour les clés liées à un monde. Les tombes restent dans le monde où le joueur est mort ; c'est une propriété du mod, pas quelque chose qu'une synchronisation peut déplacer.
+- **Support d'Applied Energistics 2** — les cellules de stockage AE2 gardent leur contenu dans des composants d'item (`ae2:storage_cell_inv`) : il voyage donc avec la sérialisation de l'inventaire. Cette version vérifie et déclare ce chemin au lieu de le laisser au hasard. Les cellules spatiales et les liens sans fil restent attachés au monde qui les possède.
+- **Sentinelle d'intégrité des composants d'item** — tout ce qu'un mod moderne garde « dans » un item est un DataComponent (l'inventaire d'une cellule AE2, le `minecraft:container` d'un shulker, les affixes Apotheosis). Si l'un d'eux disparaissait pendant une restauration, l'item arrivait correct en apparence et simplement vide. PlayerSync compare maintenant les composants déclarés par le tag stocké à ceux que porte l'item désérialisé et signale l'item et le composant exacts, au lieu de laisser un admin face à « ma cellule est revenue vide ».
+- **`/playersync compat`** — liste toutes les intégrations connues de PlayerSync, la présence du mod, le mécanisme qui porte ses données et l'état de son toggle. Liste aussi les mods connus absents ici, ce à quoi ressemble une liste de mods asymétrique entre deux serveurs d'un même réseau. Ne touche pas la base, donc reste utilisable pendant qu'on diagnostique la base. Le même rapport est affiché une fois au démarrage, avec un avertissement pour tout mod installé dont le toggle est désactivé.
+
+### Performance (miroir français)
+
+- **Sophisticated Storage et les disques RS2 rejoignent l'auto-save échelonnée** — ils n'étaient persistés qu'au logout et à l'arrêt : un crash brutal perdait tout ce qu'un joueur avait déplacé dans un shulker ou un disque depuis sa connexion. Le coût reste borné : un joueur par tick, et les blobs inchangés sont toujours ignorés par leur hash par UUID.
+- **Une transaction groupée par sauvegarde au lieu de trois** — les blobs backpack, Sophisticated Storage et RS2 vivent tous dans `backpack_data` ; ils sont désormais capturés dans une seule map et écrits en une transaction.
+- **Les conteneurs neufs ne coûtent plus une requête chacun** — le prefetch de connexion mémorise les UUID interrogés : un UUID revenu sans ligne est connu absent et la restauration prend sa branche « absent » sans second SELECT sur le main thread.
+- **La SavedData du mod n'est plus polluée par les snapshots** — lire un conteneur via `getOrCreateBackpackContents` y insérait une entrée vide et marquait la SavedData modifiée. La sonde sans création la laisse intacte.
+- **Cache curios de mort supprimé** — il sérialisait les curios de chaque joueur à chaque logout, mort et arrêt dans une map dont le seul lecteur était inatteignable depuis plusieurs versions. Du travail pur sur les chemins chauds.
+- **La file d'auto-save contient des UUID, pas des entités** — mettre en file des `ServerPlayer` gardait accessible tout le graphe d'objets d'un joueur déconnecté (inventaire, menus, liens de niveau) pendant un cycle complet. La résolution via la PlayerList au drainage est en O(1) et donne toujours l'entité vivante.
+- **Code mort supprimé** — les anciens chemins store/restore inatteignables de `ModsSupport` et `ModCompatSync`, le cache curios, `alterColumnIfNeeded` et l'utilitaire inutilisé `JDBCsetUp.update`.
+
+### Modifications (miroir français)
+
+- **Les toggles de synchronisation sont symétriques** — `sync_backpacks` et `sync_refined_storage` ne gardaient que la restauration : un serveur toggle désactivé continuait à publier des blobs de conteneurs qu'il ne relisait jamais, et sa copie locale périmée finissait par écraser celle des autres. Les deux moitiés sont gardées.
+- **`join_peer_alive_max_wait_seconds` modifie le comportement de connexion face à un pair vivant.** Avec sa valeur par défaut de 600 s, le budget de poll (`join_poll_max_attempts` × `join_poll_interval_ms`) s'épuise d'abord et il est demandé au joueur de se reconnecter, plutôt que de prendre la propriété à un pair qui peut encore être en train de committer. Réglez-la à 15-30 pour retrouver une reprise rapide des sessions fantômes, en acceptant le risque de duplication que la clé documente.
+
+---
+
+## [2.1.6] - 2026-06-09 (full audit: server performance + security + dup hardening)
 
 ### Performance (English first)
 
@@ -70,7 +142,7 @@ All notable changes to **PlayerSync** are documented here.
 
 ---
 
-## [Unreleased] - 2026-05-21 (r7)
+## [2.1.6] - 2026-05-21 (r7)
 
 ### Fixed (English first)
 
@@ -82,7 +154,7 @@ All notable changes to **PlayerSync** are documented here.
 
 ---
 
-## [Unreleased] - 2026-05-20 (r6)
+## [2.1.6] - 2026-05-20 (r6)
 
 ### Fixed (English first)
 
@@ -94,7 +166,7 @@ All notable changes to **PlayerSync** are documented here.
 
 ---
 
-## [Unreleased] - 2026-05-20 (r5)
+## [2.1.6] - 2026-05-20 (r5)
 
 ### Fixed (English first)
 
@@ -106,7 +178,7 @@ All notable changes to **PlayerSync** are documented here.
 
 ---
 
-## [Unreleased] - 2026-05-20 (r4)
+## [2.1.6] - 2026-05-20 (r4)
 
 ### Fixed (English first)
 
@@ -118,7 +190,7 @@ All notable changes to **PlayerSync** are documented here.
 
 ---
 
-## [Unreleased] - 2026-05-20 (r3)
+## [2.1.6] - 2026-05-20 (r3)
 
 ### Fixed (English first)
 
@@ -130,13 +202,13 @@ All notable changes to **PlayerSync** are documented here.
 
 ---
 
-## [Unreleased] - 2026-05-20 (r2)
+## [2.1.6] - 2026-05-20 (r2)
 
 ### Fixed (English first)
 
 - **Item dup on revive-disconnect — r1 hardening (r2)** — The r1 fix relied on `@SubscribeEvent(receiveCanceled = true)` to catch canceled `LivingDeathEvent` firings, but **NeoForge bus 8.x ignores this annotation flag at dispatch time** (`SubscribeEventListener.invoke` unconditionally skips canceled events for `ICancellableEvent`; only programmatic `addListener(priority, receiveCanceled, ...)` respects it). So r1 never received the canceled events — the tracking map stayed empty and the bug remained. r2 fixes this with two complementary detection paths: (1) a **programmatic** `LivingDeathEvent` listener registered in `VanillaSync.register()` at LOWEST priority with `receiveCanceled=true`, which actually fires for canceled deaths; (2) a **heuristic** at `onPlayerLogout`: if the player has at least one infinite-duration MobEffect AND health is below 50% of max, treat as downed-state regardless of whether `LivingDeathEvent` was canceled. The heuristic catches revive mods that prevent death via `LivingDamageEvent` cancel or Mixin (no canceled `LivingDeathEvent` ever fires in that case). Diagnostic logging (`[revive-detect]`, `[revive-track]`) now lines the path so future regressions are debuggable from `sync.log`.
 
-## [Unreleased] - 2026-05-20 (r1, superseded by r2)
+## [2.1.6] - 2026-05-20 (r1, superseded by r2)
 
 ### Fixed (English first)
 

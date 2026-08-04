@@ -4,6 +4,41 @@ Journal des erreurs rencontrées et corrigées. Chaque entrée documente un bug,
 
 ---
 
+## [2026-08-04] — #238 : duplication de backpack, `getOrCreate` rend « vide » et « inconnu » indiscernables
+
+**Context** : Bug #238 signalé par Darkdiamons. Backpack posé sur une chute avec un coffre en dessous, contenu transféré dans le coffre, backpack repris avant déconnexion → à la reconnexion, le stuff existait dans le coffre ET de nouveau dans le backpack.
+
+**Error** : Duplication silencieuse du contenu d'un conteneur vidé, sans aucune erreur dans les logs.
+
+**Root cause** : `BackpackStorage.getOrCreateBackpackContents(uuid)` est un `computeIfAbsent` (vérifié au bytecode : il insère un `CompoundTag` vide et appelle `setDirty()` quand l'UUID est absent). Le chemin de sauvegarde l'utilisait comme une simple lecture, donc un conteneur jamais chargé sur ce serveur ressortait avec un tag vide — exactement comme un conteneur réellement vidé. Un garde `saveBackpackSnapshots` annulait alors l'écriture dès que la base contenait plus de 50 octets, pour éviter d'écraser des données réelles. Conséquence : la ligne DB gardait l'ancien contenu et la connexion suivante le réinjectait dans un backpack que le joueur avait vidé.
+
+**Fix** : Protocole explicite en trois parties. (1) `StorageOwnership` mémorise les conteneurs dont PlayerSync a réellement appliqué une copie DB pendant la session — seul cas où une entrée locale absente prouve que le conteneur est vide. (2) Sonde réflexive sans création (`peekBackpackContents`, match sur le type de valeur `Map<UUID, CompoundTag>` pour ne jamais viser `accessLogRecords`) ; `ItemContentsStorage` expose déjà `has(UUID)` publiquement. (3) Pierre tombale : un tag vide est écrit délibérément et la restauration suivante efface sa copie locale. Un conteneur non « owned » n'est jamais écrit, donc il ne peut pas non plus écraser des données plus fraîches.
+
+**Prevention** :
+- **Ne jamais utiliser un `getOrCreateX()` d'un mod tiers comme une lecture.** Vérifier au bytecode (`javap -p -c`) si c'est un `computeIfAbsent` : il mute l'état ET détruit l'information « absent vs vide ».
+- **Une donnée absente et une donnée vide doivent rester distinguables jusqu'à la décision d'écriture.** Un garde du type « ne pas écrire du vide si la DB a des données » masque le symptôme et transforme une perte en duplication.
+- **La décision revient au snapshot, pas à l'écrivain.** L'écrivain doit persister exactement ce qu'on lui donne ; toute heuristique côté écriture est aveugle au contexte de session.
+- **Toute logique save/restore doit balayer le même ensemble d'items.** L'asymétrie (inventaire seul d'un côté, inventaire + Curios de l'autre) produit exactement la même classe de bug.
+
+---
+
+## [2026-08-04] — Disques Refined Storage 2 vidés : listener de codec no-op
+
+**Context** : Rapport utilisateur — des joueurs changent de serveur avec des disques Refined Storage et « ont tout perdu ».
+
+**Error** : Contenu des disques perdu après un transfert de serveur, souvent au redémarrage suivant du serveur de destination.
+
+**Root cause** : Deux défauts cumulés. (1) `StorageRepositoryImpl.createCodec(Runnable)` reçoit le listener de changement qui sera intégré à chaque stockage décodé — le dépôt lui-même passe `this::markAsChanged`. PlayerSync passait `() -> {}` **et mettait le codec résultant en cache statique**. Chaque disque restauré revenait donc avec un listener mort : RS2 ne marquait plus sa SavedData modifiée quand le joueur utilisait ce disque, la sauvegarde du monde ignorait le fichier, et tout était perdu au redémarrage. (2) L'encodage tournait sur le thread d'écriture en arrière-plan en lisant le `StorageRepository` vivant ; un échec était logué en DEBUG et ignoré, le disque n'atteignant jamais la base.
+
+**Fix** : Seul le `Method` réflexif est mis en cache ; le codec est reconstruit par dépôt avec un listener lié à `markAsChanged()`. L'encodage passe sur le main thread (schéma snapshot-puis-écriture), et un échec d'encodage est logué en erreur avec l'UUID du disque.
+
+**Prevention** :
+- **Un `Runnable` / `Consumer` passé à une factory d'un mod tiers est presque toujours un callback vivant.** Ne jamais le remplacer par un no-op « puisqu'on n'en a pas besoin » : décompiler l'appelant d'origine pour voir ce que le mod y met.
+- **Ne jamais mettre en cache un objet construit à partir d'un état lié à une instance** (ici un codec portant un listener lié à un dépôt). Cacher le handle de résolution, pas le produit.
+- **Un échec de sérialisation sur un chemin de sauvegarde est une erreur, pas un DEBUG.** Perdre silencieusement un conteneur est indiscernable d'un fonctionnement normal côté joueur.
+
+---
+
 ## [2026-06-09] — Corruption UTF-8 d'un fichier source via PowerShell 5.1 Get-Content/Set-Content
 
 **Context** : Suppression d'un bloc de lignes (méthode morte `store()`) dans `VanillaSync.java` via un one-liner PowerShell `Get-Content` + slicing + `Set-Content -Encoding utf8`.

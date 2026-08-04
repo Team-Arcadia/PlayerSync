@@ -10,7 +10,10 @@ The following mods are explicitly handled by PlayerSync — their per-player sta
 * [Sophisticated Backpacks](https://www.curseforge.com/minecraft/mc-mods/sophisticated-backpacks) — equipped & ender-chest backpack contents, upgrades and settings
 * [Sophisticated Storage](https://www.curseforge.com/minecraft/mc-mods/sophisticated-storage) — shulker / barrel / chest contents carried as items
 * [Sophisticated Core](https://www.curseforge.com/minecraft/mc-mods/sophisticated-core) — required dependency for the two above
-* [Refined Storage](https://www.curseforge.com/minecraft/mc-mods/refined-storage) — disk contents linked to disk items in the inventory
+* [Refined Storage](https://www.curseforge.com/minecraft/mc-mods/refined-storage) — disk contents linked to disk items in the inventory, ender chest and Curios slots
+* [Extra Disks](https://www.curseforge.com/minecraft/mc-mods/extra-disks) — handled by the Refined Storage disk path
+* [Applied Energistics 2](https://www.curseforge.com/minecraft/mc-mods/applied-energistics-2) — storage cell contents travel in item components (`ae2:storage_cell_inv`). Spatial cells and wireless links stay bound to the world that owns them
+* [Corail Tombstone](https://www.curseforge.com/minecraft/mc-mods/corail-tombstone) — knowledge, alignment, perks and watcher knowledge (stored in the player persistent-data tag). Graves stay in the world where the player died
 * [Accessories](https://github.com/wisp-forest/accessories) — all Accessories slots (used by The Aether)
 * [The Aether](https://github.com/The-Aether-Team/The-Aether) — Accessories slots + `AETHER_PLAYER` attachment (portals, dart count, flight timer, life shards…)
 * [Cosmetic Armor Reworked](https://www.curseforge.com/minecraft/mc-mods/cosmetic-armor-reworked) — the 4 cosmetic armor slots
@@ -21,7 +24,9 @@ The following mods are explicitly handled by PlayerSync — their per-player sta
 * [Revive Me](https://www.curseforge.com/minecraft/mc-mods/revive-me) — death event runs at LOW priority + cancel guard, fallen players are not falsely flagged as dead
 * [Corpse](https://www.curseforge.com/minecraft/mc-mods/corpse) / [Gravestone](https://www.curseforge.com/minecraft/mc-mods/gravestone-mod) (+ Curios-Compat) — dead players' curios are not overwritten with empty data
 
-Any other mod that stores its per-player state through **NeoForge AttachmentTypes** is synced automatically (Ars Nouveau, Iron's Spellbooks, Pehkui, Spice of Life: Onion, etc.).
+Any other mod that stores its per-player state through **NeoForge AttachmentTypes** is synced automatically (Ars Nouveau, Iron's Spellbooks, Pehkui, Spice of Life: Onion, etc.), as is any mod still using the older **player persistent-data tag** (`sync_persistent_data`).
+
+Run `/playersync compat` on a live server to see exactly which of these are installed, how each one's data is carried, and whether its sync toggle is enabled. The same report is printed to the log at server start.
 
 Any other mods support is also possible.
 

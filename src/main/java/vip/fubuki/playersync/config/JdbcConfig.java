@@ -51,6 +51,8 @@ public class JdbcConfig {
     public static ModConfigSpec.BooleanValue SYNC_BACKPACKS;
     public static ModConfigSpec.BooleanValue SYNC_COSMETIC_ARMOR;
     public static ModConfigSpec.BooleanValue SYNC_REFINED_STORAGE;
+    public static ModConfigSpec.BooleanValue SYNC_PERSISTENT_DATA;
+    public static ModConfigSpec.ConfigValue<List<String>> PERSISTENT_DATA_BLACKLIST;
 
     // ----- Performance tuning (new section) -----
     public static ModConfigSpec.IntValue HEARTBEAT_INTERVAL_SECONDS;
@@ -61,6 +63,7 @@ public class JdbcConfig {
     public static ModConfigSpec.IntValue POOL_STATS_INTERVAL_MINUTES;
     public static ModConfigSpec.IntValue HIKARI_POOL_MAX_SIZE;
     public static ModConfigSpec.IntValue HIKARI_LEAK_THRESHOLD_MS;
+    public static ModConfigSpec.IntValue JDBC_SOCKET_TIMEOUT_SECONDS;
 
     // ----- Safety / integrity (new section) -----
     public static ModConfigSpec.BooleanValue REFUSE_EMPTY_INVENTORY_WRITE;
@@ -157,6 +160,20 @@ public class JdbcConfig {
         SYNC_BACKPACKS = B.comment("Sync Sophisticated Backpacks + Storage contents").define("sync_backpacks", true);
         SYNC_COSMETIC_ARMOR = B.comment("Sync Cosmetic Armor Reworked slots").define("sync_cosmetic_armor", true);
         SYNC_REFINED_STORAGE = B.comment("Sync Refined Storage 2 disk contents").define("sync_refined_storage", true);
+        SYNC_PERSISTENT_DATA = B.comment(
+                "Sync the player's persistent-data tag (the legacy NeoForgeData / PlayerPersisted",
+                "scratchpad). NeoForge attachments are the modern mechanism and are synced",
+                "separately, but many mods still write here. Corail Tombstone stores knowledge,",
+                "alignment, perks and watcher knowledge in it, so leaving this off means Tombstone",
+                "progression resets on every server change.",
+                "Use persistent_data_blacklist below to exclude individual top-level keys.")
+                .define("sync_persistent_data", true);
+        PERSISTENT_DATA_BLACKLIST = B.comment(
+                "Top-level keys of the persistent-data tag that must NOT be synchronized.",
+                "Use for world-bound values (saved home positions, per-world cooldowns) that would",
+                "be meaningless or harmful on another server. Exact key names, case sensitive.",
+                "Example: [\"mymod_home_pos\", \"mymod_last_death\"]")
+                .define("persistent_data_blacklist", new ArrayList<>());
         B.pop();
 
         // ===== [performance] =====
@@ -201,6 +218,13 @@ public class JdbcConfig {
                 "Hikari leak-detection threshold (ms). Lower = more sensitive, but false positives on",
                 "slow polls. 25000 covers legitimate 15-30s poll bursts.")
                 .defineInRange("hikari_leak_threshold_ms", 25000, 2000, 600000);
+        JDBC_SOCKET_TIMEOUT_SECONDS = B.comment(
+                "Maximum time a single JDBC query may spend waiting on the socket (seconds).",
+                "Without it, a MySQL host that dies while the TCP connection stays half-open blocks",
+                "the worker thread until the OS keepalive expires — every save path stalls with it.",
+                "Must stay above your slowest legitimate query: a multi-megabyte inventory blob over",
+                "a congested link. Raise it if you see 'Communications link failure' during big saves.")
+                .defineInRange("jdbc_socket_timeout_seconds", 60, 5, 900);
         B.pop();
 
         // ===== [safety] =====

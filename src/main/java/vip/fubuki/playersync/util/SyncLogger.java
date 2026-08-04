@@ -203,9 +203,29 @@ public class SyncLogger {
     // Internal — async file writing
     // -------------------------------------------------------------------------
 
+    /**
+     * Hard ceiling on the pending-write queue.
+     *
+     * <p>The queue used to be unbounded while the flusher drained at most 100 lines every
+     * 500 ms — 200 lines/s. An error storm (a dead database retrying for every player on
+     * every tick) produces far more than that, so the backlog grew without bound and the
+     * "lock-free, never blocks the main thread" logger turned into a heap leak. Overflow is
+     * now dropped and counted, and the count is reported into the log itself so the gap is
+     * visible instead of silent.
+     */
+    private static final int MAX_QUEUED_LINES = 20_000;
+    private static final java.util.concurrent.atomic.AtomicInteger queuedLines =
+            new java.util.concurrent.atomic.AtomicInteger();
+    private static final java.util.concurrent.atomic.AtomicLong droppedLines =
+            new java.util.concurrent.atomic.AtomicLong();
+
     private static void log(String level, String message, Object... args) {
         if (!initialized.get()) return;
         try {
+            if (queuedLines.get() >= MAX_QUEUED_LINES) {
+                droppedLines.incrementAndGet();
+                return;
+            }
             String formatted = formatMessage(message, args);
             String line = String.format("[%s] [%s] [%s] %s",
                     LocalDateTime.now().format(TIME_FMT),
@@ -213,6 +233,7 @@ public class SyncLogger {
                     level,
                     formatted);
             writeQueue.add(line);
+            queuedLines.incrementAndGet();
             // FIX PERF (C3): no inline flush — background scheduler drains the queue.
         } catch (Exception ignored) {}
     }
@@ -241,25 +262,41 @@ public class SyncLogger {
     // the writer is reopened per flush, so rotation never races an open handle).
     private static int flushesSinceRotateCheck = 0;
 
+    /**
+     * Lines drained per pass. At the 500 ms cadence this is ~8000 lines/s, comfortably
+     * above any realistic burst; the old cap of 100 (200 lines/s) could not keep up with a
+     * database outage and let the backlog grow indefinitely.
+     */
+    private static final int DRAIN_BATCH = 4000;
+
     private static void flushQueue() {
         if (logPath == null) return;
         if (++flushesSinceRotateCheck >= 20) {
             flushesSinceRotateCheck = 0;
             rotateIfNeeded();
         }
+        if (writeQueue.isEmpty() && droppedLines.get() == 0) return;
         try (BufferedWriter writer = new BufferedWriter(new FileWriter(logPath.toFile(), true))) {
             String line;
             int count = 0;
-            while ((line = writeQueue.poll()) != null && count < 100) {
+            while (count < DRAIN_BATCH && (line = writeQueue.poll()) != null) {
                 writer.write(line);
                 writer.newLine();
                 count++;
+            }
+            if (count > 0) queuedLines.addAndGet(-count);
+            long dropped = droppedLines.getAndSet(0);
+            if (dropped > 0) {
+                writer.write("[" + LocalDateTime.now().format(TIME_FMT) + "] [PlayerSync-logflush] [WARN] "
+                        + dropped + " log line(s) dropped — write queue hit its " + MAX_QUEUED_LINES + " line ceiling");
+                writer.newLine();
             }
         } catch (IOException ignored) {}
     }
 
     private static void writeRaw(String line) {
         writeQueue.add(line);
+        queuedLines.incrementAndGet();
     }
 
     private static void rotateIfNeeded() {
@@ -299,6 +336,12 @@ public class SyncLogger {
     public static void shutdown() {
         try { FLUSH_EXEC.shutdown(); } catch (Exception ignored) {}
         try { FLUSH_EXEC.awaitTermination(2, TimeUnit.SECONDS); } catch (InterruptedException ignored) {}
+        // Drain FULLY. A single pass only ever wrote one batch, so on a busy shutdown the
+        // last entries — precisely the save results an admin needs after an incident —
+        // were dropped on the floor. Bounded so a runaway producer cannot hang the stop.
+        for (int pass = 0; pass < 64 && !writeQueue.isEmpty(); pass++) {
+            flushQueue();
+        }
         flushQueue();
     }
 }

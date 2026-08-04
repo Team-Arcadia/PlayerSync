@@ -88,6 +88,11 @@ public class PlayerSync {
         // Initialize dedicated PlayerSync log file (logs/playersync/sync.log)
         vip.fubuki.playersync.util.SyncLogger.init();
 
+        // Report which optional integrations are present and whether their toggle is on.
+        // An installed mod with its sync toggle disabled is the most common cause of
+        // "PlayerSync is not syncing my X" reports, so it is called out explicitly.
+        vip.fubuki.playersync.sync.addons.ModCompatRegistry.logStartupReport();
+
         // Step 3: Explicitly select the database on a raw connection (DDL only).
         try (Connection conn = JDBCsetUp.getConnection(false);
              Statement st = conn.createStatement()) {
@@ -272,26 +277,6 @@ public class PlayerSync {
         vip.fubuki.playersync.util.PoolStatsReporter.start();
 
         LOGGER.info("PlayerSync is ready!");
-    }
-
-    /**
-     * Alters a column to {@code targetType} only if its current {@code DATA_TYPE}
-     * differs. Skips expensive MDL + rebuild on every server start.
-     */
-    private static void alterColumnIfNeeded(String dbName, String table, String column, String targetTypeLower) throws SQLException {
-        try (JDBCsetUp.QueryResult qr = JDBCsetUp.executePreparedQuery(
-                "SELECT DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND COLUMN_NAME=?",
-                dbName, table, column)) {
-            ResultSet rs = qr.resultSet();
-            if (rs.next()) {
-                String current = rs.getString("DATA_TYPE");
-                if (current != null && targetTypeLower.equalsIgnoreCase(current)) {
-                    return;
-                }
-            }
-        }
-        LOGGER.info("Altering {}.{} column {} to {}", dbName, table, column, targetTypeLower.toUpperCase());
-        JDBCsetUp.executeUpdate("ALTER TABLE `" + dbName + "`.`" + table + "` MODIFY COLUMN `" + column + "` " + targetTypeLower.toUpperCase());
     }
 
     /**

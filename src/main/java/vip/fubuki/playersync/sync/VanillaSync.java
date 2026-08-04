@@ -23,7 +23,6 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.effect.MobEffect;
 import net.minecraft.world.effect.MobEffectInstance;
-import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
@@ -43,7 +42,6 @@ import net.neoforged.neoforge.event.tick.ServerTickEvent;
 import net.neoforged.neoforge.server.ServerLifecycleHooks;
 import vip.fubuki.playersync.PlayerSync;
 import vip.fubuki.playersync.config.JdbcConfig;
-import vip.fubuki.playersync.sync.addons.CuriosCache;
 import vip.fubuki.playersync.sync.addons.ModCompatSync;
 import vip.fubuki.playersync.sync.addons.ModsSupport;
 import vip.fubuki.playersync.util.JDBCsetUp;
@@ -186,6 +184,11 @@ public class VanillaSync {
         // player's next-session first snapshot (mtime check guarantees freshness).
         advancementsFileCache.keySet().removeIf(k -> k.contains(uuid));
         lastAppliedAdvancementsHash.remove(uuid);
+        // 2.1.6: release the container-storage handles established for this session
+        // (see StorageOwnership) together with their write-skip hashes. Keeping them
+        // would both leak memory on a hub server and let a stale hash suppress a write
+        // after another server changed the same blob.
+        ModsSupport.releaseSession(uuid);
     }
 
     /**
@@ -290,6 +293,7 @@ public class VanillaSync {
         h = 31 * h + java.util.Objects.hashCode(s.accessoriesData());
         h = 31 * h + java.util.Objects.hashCode(s.cosmeticArmorData());
         h = 31 * h + java.util.Objects.hashCode(s.attachmentsData());
+        h = 31 * h + java.util.Objects.hashCode(s.persistentData());
         h = 31 * h + s.xp();
         h = 31 * h + s.foodLevel();
         h = 31 * h + s.health();
@@ -620,6 +624,12 @@ public class VanillaSync {
             // as actually stuck (peer crashed mid-save). Saves typically complete
             // in < 1s, so 10s is 10× safety margin.
             final long LOGOUT_SAVE_MAX_MS = 10_000L;
+            // How long an ALIVE peer holding online=1 without a logout marker is tolerated
+            // before we take ownership anyway. The effective ceiling is also bounded by the
+            // poll budget (join_poll_max_attempts x join_poll_interval_ms): once that runs
+            // out the loop exits without a force-claim and the guarded CAS below asks the
+            // player to reconnect, which is the safe outcome.
+            final long ALIVE_PEER_MAX_WAIT_MS = JdbcConfig.JOIN_PEER_ALIVE_MAX_WAIT_SECONDS.get() * 1000L;
             final int SELF = JdbcConfig.SERVER_ID.get();
 
             boolean forceClaim = false;   // bypass online=0 / last_server=self guard
@@ -687,17 +697,20 @@ public class VanillaSync {
                     continue;
                 }
 
-                // online=1 AND logout_started_at IS NULL: peer has an ACTIVE session.
-                // The joining player is racing an actual player on another server.
-                // onPlayerLoggedInKickCheck already ran and either kicked us or cached
-                // a 'not kicked' decision — so at this point we can treat it as a
-                // ghost session (the other session didn't get its kick because the
-                // cache was empty / peer's heartbeat just landed), and force-claim.
-                // If kick_when_already_online is true, the player who SHOULD be kicked
-                // is the one who lost the race — not us.
-                if (waitedMs >= 2000L) {
+                // online=1 AND logout_started_at IS NULL: the peer has an ACTIVE session and
+                // its heartbeat is fresh. Either the joining player is racing a real session
+                // there, or the peer holds a ghost flag it has not cleared yet.
+                //
+                // 2.1.6: this is the point `join_peer_alive_max_wait_seconds` was documented
+                // to govern — and never did. The hardcoded 2 s force-claim it actually used
+                // is a duplication vector in its own right: claiming ownership makes every
+                // subsequent write from the peer fail its last_server guard, so anything the
+                // peer recorded after our claim (a pickup, a drop, a deposit) is discarded
+                // while the world still holds the matching entity. The key now applies.
+                if (ALIVE_PEER_MAX_WAIT_MS <= waitedMs) {
                     SyncLogger.raceCondition(player_uuid,
-                            "Peer " + otherServer + " online=1 without logout flag — ghost session, force-claiming (waited " + waitedMs + "ms)");
+                            "Peer " + otherServer + " online=1 without logout flag — force-claiming after "
+                                    + waitedMs + "ms (join_peer_alive_max_wait_seconds reached)");
                     forceClaim = true;
                     break;
                 }
@@ -801,20 +814,7 @@ public class VanillaSync {
 
                             // MAIN THREAD: freeze entity state (fast copies, no DB).
                             final DeferredPlayerSnapshot frozen = snapshotPlayerData(serverPlayer);
-                            final Map<UUID, CompoundTag> backpackSnapshots = ModsSupport.snapshotBackpackData(serverPlayer);
-                            final Map<UUID, CompoundTag> ssSnapshots = ModsSupport.snapshotSSData(ModsSupport.collectSSUuids(serverPlayer));
-                            final List<UUID> rs2DiskUuids;
-                            final ServerLevel rs2Level;
-                            final HolderLookup.Provider rs2Registry;
-                            if (ModList.get().isLoaded("refinedstorage")) {
-                                rs2DiskUuids = ModsSupport.collectRS2DiskUuids(serverPlayer);
-                                rs2Level = serverPlayer.serverLevel();
-                                rs2Registry = server.registryAccess();
-                            } else {
-                                rs2DiskUuids = List.of();
-                                rs2Level = null;
-                                rs2Registry = null;
-                            }
+                            final Map<UUID, CompoundTag> storageSnapshots = snapshotAllStorages(serverPlayer);
 
                             // BACKGROUND: INSERT + mod writes. The player_synced tag is
                             // added only AFTER the INSERT lands — otherwise an instant
@@ -839,11 +839,7 @@ public class VanillaSync {
                                                 "REPLACE INTO " + Tables.curios() + " (uuid, curios_item) VALUES (?, ?)",
                                                 s.uuid(), s.curiosData());
                                     }
-                                    ModsSupport.saveBackpackSnapshots(backpackSnapshots);
-                                    ModsSupport.saveSSSnapshots(ssSnapshots);
-                                    if (!rs2DiskUuids.isEmpty() && rs2Level != null) {
-                                        ModsSupport.saveRS2DisksByLevel(rs2DiskUuids, rs2Level, rs2Registry);
-                                    }
+                                    ModsSupport.saveBackpackSnapshots(storageSnapshots);
                                     server.execute(() -> {
                                         if (isPlayerOnline(server, player_uuid)) {
                                             serverPlayer.addTag("player_synced");
@@ -888,9 +884,9 @@ public class VanillaSync {
             // three sequential round-trips (accessories / cosmeticarmor / attachments).
             // isLoaded gating preserved: a stale row for an uninstalled mod yields null
             // exactly as before; neoforge_attachments is read unconditionally.
-            final String accessoriesData, cosmeticArmorData, attachmentsData;
+            final String accessoriesData, cosmeticArmorData, attachmentsData, persistentData;
             {
-                String acc = null, cos = null, att = null;
+                String acc = null, cos = null, att = null, per = null;
                 final boolean accessoriesLoaded = ModList.get().isLoaded("accessories");
                 final boolean cosmeticLoaded = ModList.get().isLoaded("cosmeticarmorreworked");
                 try (JDBCsetUp.QueryResult qr = JDBCsetUp.executePreparedQuery(
@@ -902,10 +898,12 @@ public class VanillaSync {
                             case "accessories"          -> { if (accessoriesLoaded) acc = rs.getString("data_value"); }
                             case "cosmeticarmor"        -> { if (cosmeticLoaded)    cos = rs.getString("data_value"); }
                             case "neoforge_attachments" -> att = rs.getString("data_value");
+                            case "persistent_data"      -> per = rs.getString("data_value");
+                            default -> { /* rows written by a newer version — ignore */ }
                         }
                     }
                 }
-                accessoriesData = acc; cosmeticArmorData = cos; attachmentsData = att;
+                accessoriesData = acc; cosmeticArmorData = cos; attachmentsData = att; persistentData = per;
             }
 
             // === PHASE 2: Apply to player on MAIN SERVER THREAD ===
@@ -1010,6 +1008,9 @@ public class VanillaSync {
                     ModCompatSync.applyAccessoriesFromData(serverPlayer, accessoriesData);
                     ModCompatSync.applyCosmeticArmorFromData(serverPlayer, cosmeticArmorData);
                     ModCompatSync.applyAttachmentsFromData(serverPlayer, attachmentsData);
+                    // Corail Tombstone knowledge / alignment / perks and every other mod still
+                    // using the legacy scratchpad ride along here.
+                    ModCompatSync.applyPersistentDataFromData(serverPlayer, persistentData);
 
                     // PHASE 12 PERF: prefetch ALL storage UUIDs (backpacks + SS + RS2)
                     // in a single batched SELECT, then apply from the in-memory cache
@@ -1026,22 +1027,22 @@ public class VanillaSync {
                     if (JdbcConfig.SYNC_REFINED_STORAGE.get() && ModList.get().isLoaded("refinedstorage")) {
                         prefetchUuids.addAll(ModsSupport.collectRS2DiskUuids(serverPlayer));
                     }
+                    // The prefetch scope doubles as proof-of-absence: a UUID that was queried
+                    // and came back without a row provably has no DB copy, so the restore
+                    // path can adopt the local contents without issuing its own SELECT.
+                    java.util.Map<UUID, CompoundTag> prefetched = prefetchUuids.isEmpty()
+                            ? java.util.Map.of()
+                            : ModsSupport.prefetchStorageContents(prefetchUuids);
+                    ModsSupport.setStoragePrefetchCache(prefetched, prefetchUuids);
                     if (!prefetchUuids.isEmpty()) {
-                        java.util.Map<UUID, CompoundTag> prefetched = ModsSupport.prefetchStorageContents(prefetchUuids);
-                        ModsSupport.setStoragePrefetchCache(prefetched);
                         PlayerSync.LOGGER.debug("[perf-restore] prefetched {}/{} storage UUIDs for player {}",
                                 prefetched.size(), prefetchUuids.size(), player_uuid);
                     }
                     try {
-                        // Backpacks/SS/RS2: restore methods now consume the prefetch cache
-                        // (falls back to DB on cache miss — same behavior as before).
-                        new ModsSupport().doBackPackRestore(serverPlayer);
-                        if (ModList.get().isLoaded("sophisticatedstorage")) {
-                            ModsSupport.restoreSophisticatedStorageItems(serverPlayer);
-                        }
-                        if (ModList.get().isLoaded("refinedstorage")) {
-                            ModsSupport.restoreRefinedStorageDisks(serverPlayer);
-                        }
+                        // Backpacks/SS/RS2 all read from the prefetch cache installed above.
+                        ModsSupport.doBackPackRestore(serverPlayer);
+                        ModsSupport.restoreSophisticatedStorageItems(serverPlayer);
+                        ModsSupport.restoreRefinedStorageDisks(serverPlayer);
                     } finally {
                         ModsSupport.clearStoragePrefetchCache();
                     }
@@ -1267,6 +1268,7 @@ public class VanillaSync {
                 // empty or it was an empty inventory slot
                 if (!restoredItem.isEmpty() || compoundTag.isEmpty()
                         || registryName.equals(ResourceLocation.tryParse("air"))) {
+                    verifyComponentsSurvived(registryName, compoundTag, restoredItem);
                     return restoredItem;
                 }
                 // ItemStack.of unexpectedly returned empty for a known, non-air item.
@@ -1334,6 +1336,53 @@ public class VanillaSync {
         placeholder.set(DataComponents.LORE,new ItemLore(loreList));
 
         return placeholder;
+    }
+
+    /**
+     * Canary for silently-dropped item components.
+     *
+     * <p>Everything a modern mod keeps "inside" an item is a DataComponent: an Applied
+     * Energistics storage cell holds its whole inventory in {@code ae2:storage_cell_inv},
+     * a shulker box in {@code minecraft:container}, Apotheosis gear in its affix
+     * components. PlayerSync round-trips those through {@code ItemStack#save} /
+     * {@code ItemStack#parse}, the same path vanilla uses, so they normally survive a
+     * server transfer untouched — which is precisely why a failure here is invisible:
+     * the item arrives looking correct and simply empty.
+     *
+     * <p>This compares the component keys the stored tag declared against the ones the
+     * parsed stack actually carries and reports the difference. It is expected to never
+     * fire; when it does, it names the exact item and component instead of leaving an
+     * admin with "my cell came back empty".
+     */
+    private static void verifyComponentsSurvived(ResourceLocation registryName, CompoundTag storedTag, ItemStack restored) {
+        try {
+            if (restored.isEmpty()) return;
+            if (!storedTag.contains("components", Tag.TAG_COMPOUND)) return;
+            CompoundTag components = storedTag.getCompound("components");
+            if (components.isEmpty()) return;
+            List<String> lost = null;
+            for (String key : components.getAllKeys()) {
+                // A patch entry starting with '!' is a REMOVAL, not a value to preserve.
+                if (key.isEmpty() || key.charAt(0) == '!') continue;
+                ResourceLocation typeId = ResourceLocation.tryParse(key);
+                if (typeId == null) continue;
+                var type = BuiltInRegistries.DATA_COMPONENT_TYPE.get(typeId);
+                // Not registered here => the mod is absent on this server. That is the
+                // placeholder path's job to report, not a silent-drop bug.
+                if (type == null) continue;
+                if (!restored.has(type)) {
+                    if (lost == null) lost = new ArrayList<>(2);
+                    lost.add(key);
+                }
+            }
+            if (lost != null) {
+                PlayerSync.LOGGER.error("[item-integrity] {} lost component(s) {} while being restored —"
+                        + " the item's stored contents did not survive deserialization", registryName, lost);
+                SyncLogger.dataLoss("-", "item " + registryName + " lost components " + lost + " on restore");
+            }
+        } catch (Throwable ignored) {
+            // A diagnostic must never break a restore.
+        }
     }
 
     /**
@@ -1563,29 +1612,12 @@ public class VanillaSync {
 
                 String puuid = player.getUUID().toString();
                 try {
-                    // Cache curios before snapshot
-                    if (ModList.get().isLoaded("curios")) {
-                        CuriosCache.tryStoreCuriosToCache(player);
-                    }
-
                     // === MAIN THREAD: Snapshot (entity reads, fast) ===
                     // PHASE 18: returns DeferredPlayerSnapshot — item NBT serialization happens on BG.
                     final DeferredPlayerSnapshot frozen = snapshotPlayerData(player);
-                    final Map<UUID, CompoundTag> backpackSnapshots = ModsSupport.snapshotBackpackData(player);
-                    // FIX C3: snapshot SS CompoundTags on main thread (was a background-thread read).
-                    final Map<UUID, CompoundTag> ssSnapshots = ModsSupport.snapshotSSData(ModsSupport.collectSSUuids(player));
-                    final List<UUID> rs2DiskUuids;
-                    final ServerLevel rs2Level;
-                    final HolderLookup.Provider rs2Registry;
-                    if (ModList.get().isLoaded("refinedstorage")) {
-                        rs2DiskUuids = ModsSupport.collectRS2DiskUuids(player);
-                        rs2Level = player.serverLevel();
-                        rs2Registry = player.getServer().registryAccess();
-                    } else {
-                        rs2DiskUuids = List.of();
-                        rs2Level = null;
-                        rs2Registry = null;
-                    }
+                    // Backpacks / Sophisticated Storage / RS2 disks are all captured here: their
+                    // SavedData is not thread-safe and RS2 encoding must not run on the writer.
+                    final Map<UUID, CompoundTag> storageSnapshots = snapshotAllStorages(player);
 
                     // === BACKGROUND THREAD: DB writes (parallel across all players) ===
                     futures.add(CompletableFuture.runAsync(() -> {
@@ -1594,11 +1626,7 @@ public class VanillaSync {
                             PlayerDataSnapshot snapshot = frozen.materialize();
                             boolean persisted = writeSnapshotToDB(snapshot, true);
                             if (persisted) {
-                                ModsSupport.saveBackpackSnapshots(backpackSnapshots);
-                                ModsSupport.saveSSSnapshots(ssSnapshots);
-                                if (!rs2DiskUuids.isEmpty() && rs2Level != null) {
-                                    ModsSupport.saveRS2DisksByLevel(rs2DiskUuids, rs2Level, rs2Registry);
-                                }
+                                ModsSupport.saveBackpackSnapshots(storageSnapshots);
                                 long dur = System.currentTimeMillis() - t0;
                                 PlayerSync.LOGGER.info("Saved player {} data on server shutdown in {}ms", puuid, dur);
                                 SyncLogger.saveCompleted(puuid, "SHUTDOWN", dur);
@@ -1635,6 +1663,10 @@ public class VanillaSync {
             }
         }
         JDBCsetUp.executePreparedUpdate("UPDATE " + Tables.serverInfo() + " SET enable=0 WHERE id=?", JdbcConfig.SERVER_ID.get());
+
+        // Every session ends here — drop the container-storage handles so a restart starts
+        // from a clean slate instead of trusting ownership recorded before the shutdown.
+        ModsSupport.releaseAllSessions();
 
         // Phase 3: stop heartbeat before pool shutdown so its tick doesn't race with pool close.
         vip.fubuki.playersync.util.HeartbeatService.stop();
@@ -1694,20 +1726,12 @@ public class VanillaSync {
                 if (!player.getTags().contains("player_synced") || player.isDeadOrDying()) continue;
                 try {
                     final DeferredPlayerSnapshot frozen = snapshotPlayerData(player);
-                    final Map<UUID, CompoundTag> backpackSnapshots = ModsSupport.snapshotBackpackData(player);
-                    final Map<UUID, CompoundTag> ssSnapshots = ModsSupport.snapshotSSData(ModsSupport.collectSSUuids(player));
+                    final Map<UUID, CompoundTag> storageSnapshots = snapshotAllStorages(player);
                     // Direct synchronous write (no executor, no lock) — materialize inline.
                     PlayerDataSnapshot snapshot = frozen.materialize();
                     boolean persisted = writeSnapshotToDB(snapshot, true);
                     if (persisted) {
-                        ModsSupport.saveBackpackSnapshots(backpackSnapshots);
-                        ModsSupport.saveSSSnapshots(ssSnapshots);
-                        if (ModList.get().isLoaded("refinedstorage")) {
-                            List<UUID> rs2 = ModsSupport.collectRS2DiskUuids(player);
-                            if (!rs2.isEmpty()) {
-                                ModsSupport.saveRS2DisksByLevel(rs2, player.serverLevel(), server.registryAccess());
-                            }
-                        }
+                        ModsSupport.saveBackpackSnapshots(storageSnapshots);
                         SyncLogger.saveCompleted(puuid, "EMERGENCY_FLUSH", 0);
                         flushed++;
                     } else {
@@ -1900,29 +1924,13 @@ public class VanillaSync {
             }
 
             // === MAIN THREAD: Snapshot ALL entity state (fast, no DB I/O) ===
-            if (ModList.get().isLoaded("curios") && !player.isDeadOrDying()) {
-                CuriosCache.tryStoreCuriosToCache((ServerPlayer) player);
-            }
-
             // PHASE 18: freeze on main thread (fast copies), materialize on BG.
             final DeferredPlayerSnapshot frozen = snapshotPlayerData(player);
 
-            // Collect backpack/SS/RS2 data — snapshots on main thread (no async reads)
-            final Map<UUID, CompoundTag> backpackSnapshots = ModsSupport.snapshotBackpackData(player);
-            // FIX C3: SS CompoundTags snapshotted on main thread (frozen copies).
-            final Map<UUID, CompoundTag> ssSnapshots = ModsSupport.snapshotSSData(ModsSupport.collectSSUuids(player));
-            final List<UUID> rs2DiskUuids;
-            final ServerLevel rs2Level;
-            final HolderLookup.Provider rs2RegistryAccess;
-            if (ModList.get().isLoaded("refinedstorage") && player instanceof ServerPlayer sp) {
-                rs2DiskUuids = ModsSupport.collectRS2DiskUuids(player);
-                rs2Level = sp.serverLevel();
-                rs2RegistryAccess = sp.getServer().registryAccess();
-            } else {
-                rs2DiskUuids = List.of();
-                rs2Level = null;
-                rs2RegistryAccess = null;
-            }
+            // Backpacks / Sophisticated Storage / RS2 disks: all captured here on the main
+            // thread. Their SavedData is a plain HashMap and RS2 additionally has to run a
+            // codec encode, neither of which is safe off-thread.
+            final Map<UUID, CompoundTag> storageSnapshots = snapshotAllStorages(player);
 
             // === NON-BLOCKING: submit async save, main thread returns immediately ===
             // The online flag stays 1 until the async save completes → kick mechanism
@@ -1972,13 +1980,7 @@ public class VanillaSync {
                     final long tCore = System.currentTimeMillis();
                     if (persisted) {
                         lastWrittenSnapshotHash.put(player_uuid, computeSnapshotHash(snapshot));
-                        ModsSupport.saveBackpackSnapshots(backpackSnapshots);
-                        final long tBp = System.currentTimeMillis();
-                        ModsSupport.saveSSSnapshots(ssSnapshots);
-                        final long tSs = System.currentTimeMillis();
-                        if (!rs2DiskUuids.isEmpty() && rs2Level != null) {
-                            ModsSupport.saveRS2DisksByLevel(rs2DiskUuids, rs2Level, rs2RegistryAccess);
-                        }
+                        ModsSupport.saveBackpackSnapshots(storageSnapshots);
                         final long tEnd = System.currentTimeMillis();
                         long total = tEnd - t0;
                         PlayerSync.LOGGER.info("Logout save completed for player {} in {}ms", player_uuid, total);
@@ -1986,8 +1988,8 @@ public class VanillaSync {
                         SyncLogger.perf("LOGOUT breakdown [" + player_uuid + "]",
                                 (tCore - t0));
                         if (total > 200) {
-                            String detail = "core=" + (tCore - t0) + "ms backpacks=" + (tBp - tCore)
-                                    + "ms ss=" + (tSs - tBp) + "ms rs2=" + (tEnd - tSs) + "ms total=" + total + "ms";
+                            String detail = "core=" + (tCore - t0) + "ms storage=" + (tEnd - tCore)
+                                    + "ms blobs=" + storageSnapshots.size() + " total=" + total + "ms";
                             PlayerSync.LOGGER.info("[perf-logout] {} {}", player_uuid, detail);
                             // PHASE 11: also log to sync.log so field reports don't miss the breakdown.
                             SyncLogger.perf("LOGOUT " + player_uuid + " " + detail, total);
@@ -2213,7 +2215,8 @@ public class VanillaSync {
             String equipment, String inventory, String enderChest, String effects,
             String advancements,
             // Mod data snapshots (serialized strings, thread-safe)
-            String curiosData, String accessoriesData, String cosmeticArmorData, String attachmentsData
+            String curiosData, String accessoriesData, String cosmeticArmorData, String attachmentsData,
+            String persistentData
     ) {}
 
     /**
@@ -2235,6 +2238,7 @@ public class VanillaSync {
             String uuid, int xp, int score, int foodLevel, int health,
             String effects, String advancements,
             String curiosData, String accessoriesData, String cosmeticArmorData, String attachmentsData,
+            String persistentData,
             // Deferred — ItemStack copies, serialized to strings on BG via materialize()
             ItemStack leftHand, ItemStack cursors,
             ItemStack[] armor, ItemStack[] inventory, ItemStack[] enderChest
@@ -2258,7 +2262,7 @@ public class VanillaSync {
                     leftHandStr, cursorsStr,
                     armorMap.toString(), inventoryMap.toString(), enderChestMap.toString(), effects,
                     advancements,
-                    curiosData, accessoriesData, cosmeticArmorData, attachmentsData
+                    curiosData, accessoriesData, cosmeticArmorData, attachmentsData, persistentData
             );
         }
     }
@@ -2272,6 +2276,38 @@ public class VanillaSync {
      *
      * <p>Main-thread cost drops from ~200-300ms to ~20-50ms for a full inventory.
      */
+    /**
+     * MAIN-THREAD capture of every external container the player carries: Sophisticated
+     * Backpacks, Sophisticated Storage items and Refined Storage 2 disks.
+     *
+     * <p>All three mods persist into the same {@code backpack_data} table keyed by the
+     * container's own UUID, so merging them into one map means one batched transaction per
+     * save instead of three, and one place where the main-thread/background-thread boundary
+     * is enforced.
+     *
+     * <p>Must be called on the server main thread: the mods' SavedData are plain HashMaps
+     * and the RS2 codec encode reads live storage objects.
+     */
+    private static Map<UUID, CompoundTag> snapshotAllStorages(Player player) {
+        Map<UUID, CompoundTag> all = new HashMap<>();
+        try {
+            all.putAll(ModsSupport.snapshotBackpackData(player));
+        } catch (Exception e) {
+            PlayerSync.LOGGER.error("[snapshot-storage] backpack capture failed for {}", player.getUUID(), e);
+        }
+        try {
+            all.putAll(ModsSupport.snapshotSSData(player));
+        } catch (Exception e) {
+            PlayerSync.LOGGER.error("[snapshot-storage] Sophisticated Storage capture failed for {}", player.getUUID(), e);
+        }
+        try {
+            all.putAll(ModsSupport.snapshotRS2Disks(player));
+        } catch (Exception e) {
+            PlayerSync.LOGGER.error("[snapshot-storage] RS2 disk capture failed for {}", player.getUUID(), e);
+        }
+        return all;
+    }
+
     private static DeferredPlayerSnapshot snapshotPlayerData(Player player) throws Exception {
         String uuid = player.getUUID().toString();
         int XP = getTotalExperience(player);
@@ -2351,6 +2387,8 @@ public class VanillaSync {
         String accessoriesData = ModCompatSync.snapshotAccessories(player);
         String cosmeticArmorData = ModCompatSync.snapshotCosmeticArmor(player);
         String attachmentsData = ModCompatSync.snapshotAttachments(player);
+        // Legacy persistent-data scratchpad (Corail Tombstone progression lives here).
+        String persistentData = ModCompatSync.snapshotPersistentData(player);
 
         // NOTE: Sophisticated Backpacks/Storage/RS2 saves are intentionally NOT in the
         // periodic snapshot — their contents live in server-side SavedData and are
@@ -2359,7 +2397,7 @@ public class VanillaSync {
         return new DeferredPlayerSnapshot(
                 uuid, XP, score, foodLevel, health,
                 effectMap.toString(), advancements,
-                curiosData, accessoriesData, cosmeticArmorData, attachmentsData,
+                curiosData, accessoriesData, cosmeticArmorData, attachmentsData, persistentData,
                 leftHandStack, cursorsStack, armor, inventory, enderChest
         );
     }
@@ -2452,6 +2490,7 @@ public class VanillaSync {
         addModDataToBatch(batch, s.uuid(), "accessories", s.accessoriesData(), serverId, serverGuard);
         addModDataToBatch(batch, s.uuid(), "cosmeticarmor", s.cosmeticArmorData(), serverId, serverGuard);
         addModDataToBatch(batch, s.uuid(), "neoforge_attachments", s.attachmentsData(), serverId, serverGuard);
+        addModDataToBatch(batch, s.uuid(), "persistent_data", s.persistentData(), serverId, serverGuard);
 
         // Execute all in one transaction. First statement is the core UPDATE on
         // player_data — if it affects 0 rows, the last_server guard blocked the write
@@ -2551,6 +2590,10 @@ public class VanillaSync {
                         + " WHERE uuid=? AND mod_id=? AND " + modDataGuard,
                 emptyMap, s.uuid(), "cosmeticarmor", s.uuid(), serverId});
 
+        // Persistent data is progression, not inventory: a Tombstone player must not lose
+        // their knowledge and perks because they disconnected while downed.
+        addModDataToBatch(batch, s.uuid(), "persistent_data", s.persistentData(), serverId, serverGuard);
+
         int[] counts = JDBCsetUp.executeBatchTransaction(batch.toArray(new Object[0][]));
         if (counts.length > 0 && counts[0] == 0) {
             SyncLogger.guardBlocked(s.uuid(), serverId,
@@ -2586,12 +2629,15 @@ public class VanillaSync {
                 + " SET xp=?, effects=?, score=?, food_level=?, health=?,"
                 + "     advancements=COALESCE(?, advancements), last_server=?"
                 + " WHERE uuid=? AND " + serverGuard;
-        int[] counts = JDBCsetUp.executeBatchTransaction(new Object[][]{
-                new Object[]{sql,
-                        s.xp(), s.effects(), s.score(), s.foodLevel(), s.health(),
-                        s.advancements(), serverId,
-                        s.uuid(), serverId}
-        });
+        List<Object[]> batch = new ArrayList<>(2);
+        batch.add(new Object[]{sql,
+                s.xp(), s.effects(), s.score(), s.foodLevel(), s.health(),
+                s.advancements(), serverId,
+                s.uuid(), serverId});
+        // Death is exactly when Corail Tombstone rewrites knowledge / alignment, so the
+        // persistent-data blob belongs in the non-item death save.
+        addModDataToBatch(batch, s.uuid(), "persistent_data", s.persistentData(), serverId, serverGuard);
+        int[] counts = JDBCsetUp.executeBatchTransaction(batch.toArray(new Object[0][]));
         if (counts.length > 0 && counts[0] == 0) {
             SyncLogger.guardBlocked(s.uuid(), serverId,
                     "death-save non-item UPDATE affected 0 rows — last_server mismatch");
@@ -2639,7 +2685,12 @@ public class VanillaSync {
     // FIX PERF: Staggered auto-save. Instead of snapshotting ALL 35 players in one tick
     // (770-3605ms spike → 15-36s TPS drop), we save 1 player per tick over 35 ticks
     // (22-103ms per tick → imperceptible). The queue is refilled every AUTO_SAVE_INTERVAL.
-    private static final List<ServerPlayer> autoSaveQueue = new ArrayList<>();
+    //
+    // 2.1.6: the queue holds UUIDs, not ServerPlayer references. Holding entities kept a
+    // disconnected player's whole object graph (inventory, container menus, level links)
+    // reachable for up to a full auto-save cycle, and the entity could go stale under us.
+    // Resolving through the PlayerList at drain time is O(1) and always yields the live one.
+    private static final List<UUID> autoSaveQueue = new ArrayList<>();
 
     /**
      * PHASE 18: public entry point for PeriodicSaveService to enqueue all online
@@ -2656,12 +2707,11 @@ public class VanillaSync {
     public static void enqueueAllOnlineForStaggeredSave(MinecraftServer server) {
         if (server == null) return;
         // Build a quick lookup of current queue UUIDs (the queue is typically small).
-        java.util.Set<UUID> already = new java.util.HashSet<>(autoSaveQueue.size());
-        for (ServerPlayer p : autoSaveQueue) already.add(p.getUUID());
+        java.util.Set<UUID> already = new java.util.HashSet<>(autoSaveQueue);
         int added = 0;
         for (ServerPlayer p : server.getPlayerList().getPlayers()) {
-            if (!already.contains(p.getUUID())) {
-                autoSaveQueue.add(p);
+            if (already.add(p.getUUID())) {
+                autoSaveQueue.add(p.getUUID());
                 added++;
             }
         }
@@ -2669,14 +2719,11 @@ public class VanillaSync {
             PlayerSync.LOGGER.debug("[periodic-save] enqueued {} players for staggered save (queue size={})", added, autoSaveQueue.size());
         }
     }
-    private static int autoCleanCuriosCacheTickCounter = 0;
-    private static final int AUTO_CLEAN_CURIOS_CACHE_INTERVAL_TICKS = 36000; // Every 30 min
 
     @SubscribeEvent
     public static void onServerTick(ServerTickEvent.Post event) {
         heartbeatTickCounter++;
         autoSaveTickCounter++;
-        autoCleanCuriosCacheTickCounter++;
 
         // PERF (A7): every 600 ticks (~30 s) drop any connectCheckCache entry older
         // than CONNECT_CHECK_TTL_MS. Stops the map from leaking when a player triggers
@@ -2722,27 +2769,35 @@ public class VanillaSync {
             autoSaveQueue.clear();
             MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
             if (server != null) {
-                autoSaveQueue.addAll(server.getPlayerList().getPlayers());
+                for (ServerPlayer p : server.getPlayerList().getPlayers()) {
+                    autoSaveQueue.add(p.getUUID());
+                }
             }
         }
 
         // Process ONE player from the queue per tick (staggered)
         if (!autoSaveQueue.isEmpty()) {
-            ServerPlayer player = autoSaveQueue.removeFirst();
-            String puuid = player.getUUID().toString();
+            UUID queued = autoSaveQueue.removeFirst();
+            MinecraftServer srv = ServerLifecycleHooks.getCurrentServer();
+            ServerPlayer player = srv == null ? null : srv.getPlayerList().getPlayer(queued);
+            String puuid = queued.toString();
 
-            // Skip invalid players (same guards as before)
-            // AUDIT FIX: also skip players who disconnected while queued — their entity
-            // still carries the player_synced tag, so the old guard chain snapshotted a
-            // stale entity and burned a DB round-trip before the online=0 check caught it.
-            if (!player.hasDisconnected() && !player.isDeadOrDying() && !syncNotCompletedPlayer.contains(puuid)
+            // A player who left while queued simply is not in the list any more, so the
+            // lookup returns null and the whole snapshot + DB round-trip is skipped.
+            if (player != null
+                    && !player.hasDisconnected() && !player.isDeadOrDying() && !syncNotCompletedPlayer.contains(puuid)
                     && !pendingLogoutSaves.containsKey(puuid) && player.getTags().contains("player_synced")) {
                 ReentrantLock lock = getPlayerLock(puuid);
                 if (lock.tryLock()) {
                     try {
                         // PHASE 18: freeze on main thread (fast copies), materialize on BG.
                         final DeferredPlayerSnapshot frozen = snapshotPlayerData(player);
-                        final Map<UUID, CompoundTag> backpackSnapshots = ModsSupport.snapshotBackpackData(player);
+                        // 2.1.6: Sophisticated Storage and RS2 disks join the auto-save. They
+                        // used to be persisted only at logout / shutdown, so a hard crash lost
+                        // everything a player had moved into a shulker or a disk since login.
+                        // Cost stays bounded: one player per tick, and skipUnchanged below
+                        // means untouched blobs are never rewritten.
+                        final Map<UUID, CompoundTag> storageSnapshots = snapshotAllStorages(player);
 
                         executorService.submit(() -> {
                             // FIX P0-a/b/c (staggered auto-save BG): same triple guard as SaveToFile.
@@ -2771,10 +2826,10 @@ public class VanillaSync {
                                     // A player moving items INSIDE a backpack leaves the
                                     // core hash unchanged — previously the early return
                                     // dropped the changed blob until logout, widening the
-                                    // crash-loss window. Persist backpack-only changes;
+                                    // crash-loss window. Persist container-only changes;
                                     // the per-UUID hash inside skipUnchanged=true keeps
                                     // unchanged blobs from being rewritten.
-                                    ModsSupport.saveBackpackSnapshots(backpackSnapshots, true);
+                                    ModsSupport.saveBackpackSnapshots(storageSnapshots, true);
                                     return;
                                 }
                                 boolean persisted = writeSnapshotToDB(snapshot);
@@ -2782,9 +2837,9 @@ public class VanillaSync {
                                     lastWrittenSnapshotHash.put(puuid, newHash);
                                     // AUDIT FIX (write amplification): skipUnchanged=true —
                                     // health/xp churn changes the core hash on nearly every
-                                    // auto-save, but the backpack MEDIUMBLOBs are usually
+                                    // auto-save, but the container MEDIUMBLOBs are usually
                                     // untouched; don't rewrite them unconditionally.
-                                    ModsSupport.saveBackpackSnapshots(backpackSnapshots, true);
+                                    ModsSupport.saveBackpackSnapshots(storageSnapshots, true);
                                 } else {
                                     PlayerSync.LOGGER.warn("Staggered auto-save: core write blocked for {}", puuid);
                                     SyncLogger.saveSkipped(puuid, "AUTO", "core guard blocked");
@@ -2804,17 +2859,10 @@ public class VanillaSync {
             }
         }
 
-        // Clean expired curios cache
-        if (autoCleanCuriosCacheTickCounter >= AUTO_CLEAN_CURIOS_CACHE_INTERVAL_TICKS) {
-            autoCleanCuriosCacheTickCounter = 0;
-            executorService.submit(() -> {
-                try {
-                    CuriosCache.RemoveExpiredCuriosCache();
-                } catch (Exception e) {
-                    PlayerSync.LOGGER.error("An error occurred while cleaning curios cache: {}", e.getMessage());
-                }
-            });
-        }
+        // NOTE: the death-time curios cache was removed in 2.1.6. It serialized every
+        // player's curios on each logout, death and shutdown into a map whose only reader
+        // had itself been unreachable for several releases — pure work on the hot paths.
+        // Curios are captured by snapshotPlayerData like every other slot type.
     }
 
     private static void setXpForPlayer(ServerPlayer serverPlayer, int databaseXp) {
@@ -2870,9 +2918,6 @@ public class VanillaSync {
         String puuid = player.getUUID().toString();
 
         if (deadPlayerWhileLogging.contains(puuid)) return;
-
-        // Always cache curios on death (API returns empty for dead players later)
-        CuriosCache.tryStoreCuriosToCache(player);
 
         // PHASE 19: honour save_on_death config. Keeping-charm / death-drop-replacement
         // mods (Twilight Forest Charm of Keeping, Corail Tombstone items, etc.) run

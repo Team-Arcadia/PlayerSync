@@ -154,8 +154,24 @@ public class JDBCsetUp {
                 + "&prepStmtCacheSize=256"
                 + "&prepStmtCacheSqlLimit=2048"
                 + "&useCompression=true"
-                + "&tcpNoDelay=true";
+                + "&tcpNoDelay=true"
+                // AUDIT FIX (hung worker): without a socket timeout a query issued to a
+                // MySQL host that dies while the TCP connection stays half-open blocks its
+                // worker thread until the OS keepalive expires — potentially hours. With a
+                // 16-thread pool that is a full stall of every save path. The value must
+                // stay well above the slowest legitimate query (a multi-megabyte MEDIUMBLOB
+                // over a congested link), hence the generous default.
+                + "&socketTimeout=" + (socketTimeoutSeconds() * 1000L)
+                + "&connectTimeout=10000";
         return url;
+    }
+
+    private static int socketTimeoutSeconds() {
+        try {
+            return JdbcConfig.JDBC_SOCKET_TIMEOUT_SECONDS.get();
+        } catch (Throwable t) {
+            return 60;
+        }
     }
 
     /**
@@ -172,10 +188,16 @@ public class JDBCsetUp {
             return DriverManager.getConnection(
                     buildUrl(false), JdbcConfig.USERNAME.get(), JdbcConfig.PASSWORD.get());
         }
-        if (dataSource == null || dataSource.isClosed()) {
-            throw new SQLException("[PlayerSync] HikariCP pool is not initialised — call initPool() first.");
+        // AUDIT FIX (shutdown race): read the volatile ONCE. The previous check-then-act
+        // let shutdownPool() null the field between the guard and the call, so a save task
+        // racing server stop failed with a NullPointerException — which every caller
+        // catches as SQLException only, so it propagated as an unhandled error instead of
+        // the intended "pool not available" message.
+        HikariDataSource ds = dataSource;
+        if (ds == null || ds.isClosed()) {
+            throw new SQLException("[PlayerSync] HikariCP pool is not initialised or already closed.");
         }
-        return dataSource.getConnection();
+        return ds.getConnection();
     }
 
     public static Connection getConnection() throws SQLException {
@@ -207,17 +229,6 @@ public class JDBCsetUp {
         LOGGER.trace(sql);
         try (Connection conn = getConnection(false);
              PreparedStatement stmt = conn.prepareStatement(sql)) {
-            stmt.executeUpdate();
-        }
-    }
-
-    public static void update(String sql, String... argument) throws SQLException {
-        LOGGER.trace(sql);
-        try (Connection conn = getConnection();
-             PreparedStatement stmt = conn.prepareStatement(sql)) {
-            for (int i = 0; i < argument.length; i++) {
-                stmt.setString(i + 1, argument[i]);
-            }
             stmt.executeUpdate();
         }
     }
