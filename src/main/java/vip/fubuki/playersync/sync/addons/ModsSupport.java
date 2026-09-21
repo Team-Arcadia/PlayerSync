@@ -45,7 +45,7 @@ public class ModsSupport {
         final String playerUuid = player.getUUID().toString();
         // PlayerInventoryProvider covers main inventory, armor, offhand and — when the
         // corresponding integration is installed — Curios slots.
-        net.p3pp3rf1y.sophisticatedbackpacks.util.PlayerInventoryProvider.get().runOnBackpacks(player,
+        runOnBackpacksCompat(player,
                 (ItemStack backpackItem, String handler, String identifier, int slot) -> {
                     restoreSingleBackpack(playerUuid, backpackItem);
                     return false;
@@ -491,7 +491,7 @@ public class ModsSupport {
         try {
             net.p3pp3rf1y.sophisticatedbackpacks.backpack.BackpackStorage store =
                     net.p3pp3rf1y.sophisticatedbackpacks.backpack.BackpackStorage.get();
-            net.p3pp3rf1y.sophisticatedbackpacks.util.PlayerInventoryProvider.get().runOnBackpacks(player,
+            runOnBackpacksCompat(player,
                     (ItemStack backpackItem, String handler, String identifier, int slot) -> {
                         snapshotSingleBackpack(playerUuid, store, backpackItem, data);
                         return false;
@@ -544,6 +544,35 @@ public class ModsSupport {
         }
     }
 
+    private static volatile java.lang.reflect.Method runOnBackpacksMethod;
+
+    /**
+     * Calls PlayerInventoryProvider.runOnBackpacks(Player, BackpackInventorySlotConsumer)
+     * reflectively. Newer Sophisticated Backpacks releases changed the return type from
+     * void to boolean, which breaks a direct call compiled against the older API with a
+     * NoSuchMethodError. Resolving by name and parameter types works with both.
+     */
+    private static void runOnBackpacksCompat(Player player,
+            net.p3pp3rf1y.sophisticatedbackpacks.util.PlayerInventoryProvider.BackpackInventorySlotConsumer consumer) {
+        try {
+            java.lang.reflect.Method m = runOnBackpacksMethod;
+            if (m == null) {
+                m = net.p3pp3rf1y.sophisticatedbackpacks.util.PlayerInventoryProvider.class.getMethod("runOnBackpacks",
+                        Player.class,
+                        net.p3pp3rf1y.sophisticatedbackpacks.util.PlayerInventoryProvider.BackpackInventorySlotConsumer.class);
+                runOnBackpacksMethod = m;
+            }
+            m.invoke(net.p3pp3rf1y.sophisticatedbackpacks.util.PlayerInventoryProvider.get(), player, consumer);
+        } catch (java.lang.reflect.InvocationTargetException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof RuntimeException re) throw re;
+            if (cause instanceof Error err) throw err;
+            throw new IllegalStateException(cause);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("Sophisticated Backpacks runOnBackpacks API not found", e);
+        }
+    }
+
     private static boolean isBackpackItem(ItemStack stack) {
         if (stack == null || stack.isEmpty()) return false;
         net.minecraft.resources.ResourceLocation loc =
@@ -559,7 +588,7 @@ public class ModsSupport {
         java.util.List<UUID> uuids = new java.util.ArrayList<>();
         if (!ModList.get().isLoaded("sophisticatedbackpacks")) return uuids;
         try {
-            net.p3pp3rf1y.sophisticatedbackpacks.util.PlayerInventoryProvider.get().runOnBackpacks(player,
+            runOnBackpacksCompat(player,
                     (ItemStack stack, String handler, String identifier, int slot) -> {
                         addBackpackUuid(stack, uuids);
                         return false;

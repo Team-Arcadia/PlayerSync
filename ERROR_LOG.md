@@ -394,3 +394,17 @@ Logout BG task acquiert maintenant `bgLock.lock()` (blocking) pour sérialiser p
 **Prevention** : **Tout pool/queue critique doit être monitoré périodiquement** avec des seuils d'alerte sous la capacité max. Invisible ≠ sain.
 
 ---
+
+## [2026-09-21 08:50] — Gradle build exhausted host RAM
+**Context:** Running `./gradlew build` for the 2.1.7 Sophisticated Backpacks fix while the VS Code Java extension was also importing the project.
+**Error:** Several JVMs aborted with "insufficient memory for the Java Runtime Environment" (hs_err_pid*.log in the project root); over 100 java processes on the host.
+**Root cause:** `org.gradle.parallel=true` plus daemons at -Xmx1G each, competing with the IDE's own Gradle import; crashed daemons were respawned.
+**Fix:** `./gradlew --stop`, then `./gradlew build --no-daemon --no-parallel --max-workers=1`.
+**Prevention:** Always build with `--no-daemon --no-parallel --max-workers=1` on this machine, and announce the build before running it.
+
+## [2026-09-21 08:40] — NoSuchMethodError on runOnBackpacks (Sophisticated Backpacks)
+**Context:** Player join on a server with a recent Sophisticated Backpacks release.
+**Error:** `NoSuchMethodError: void PlayerInventoryProvider.runOnBackpacks(Player, BackpackInventorySlotConsumer)` in `ModsSupport.collectBackpackUuids`, crashing the server tick loop.
+**Root cause:** Upstream changed the return type from void to boolean; the descriptor compiled into PlayerSync no longer resolves. `catch (Exception)` does not catch `Error`.
+**Fix:** `runOnBackpacksCompat` resolves the method reflectively by name and parameter types.
+**Prevention:** Call soft-dependency APIs whose signatures may change through reflection, or catch `LinkageError` at the integration boundary.

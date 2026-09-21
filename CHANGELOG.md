@@ -4,6 +4,18 @@ All notable changes to **PlayerSync** are documented here.
 
 ---
 
+## [2.1.7] - 2026-09-21 (Sophisticated Backpacks API compatibility)
+
+### Fixed (English first)
+
+- **Server crash on player join with recent Sophisticated Backpacks releases** - `PlayerInventoryProvider.runOnBackpacks` changed its return type from `void` to `boolean`. PlayerSync was compiled against the old signature, so the JVM could no longer link the call and threw `NoSuchMethodError` in the server tick loop (`collectBackpackUuids` during `doPlayerJoin`). The method is now resolved by name and parameter types at runtime, which works with both the old and the new Sophisticated Backpacks API.
+
+### Corrigé (Français)
+
+- **Crash du serveur à la connexion avec les versions récentes de Sophisticated Backpacks** - `PlayerInventoryProvider.runOnBackpacks` renvoie désormais `boolean` au lieu de `void`. PlayerSync était compilé contre l'ancienne signature, la JVM ne trouvait plus la méthode et levait `NoSuchMethodError` dans la boucle de tick du serveur. La méthode est maintenant résolue à l'exécution par son nom et ses paramètres, ce qui fonctionne avec l'ancienne comme avec la nouvelle API.
+
+---
+
 ## [2.1.6] - 2026-08-04 (container duplication, Refined Storage loss, AE2 + Corail Tombstone)
 
 ### Fixed (English first)
